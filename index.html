@@ -268,8 +268,21 @@ function tokenize(s) {
   }
   return out;
 }
+// Versiones especiales: si solo una descripción la tiene, son productos distintos (ej. mandarria antichispas vs mandarria normal).
+const QUAL_VARIANT = new Set(tokenize(`antichispas inoxidable inox galvanizado industrial reforzado electrico inalambrico bateria neumatico hidraulico
+  trifasico monofasico bifasico explosion dielectrico aislado impermeable sanitario presion termofusion soldable cementar roscado`.replace(/\s+/g, ' ')));
+// Materiales: solo cuentan si AMBAS descripciones dicen el material y son distintos (una descripción más detallada no es una diferencia).
+const QUAL_MATERIAL = new Set(tokenize(`bronce cobre laton aluminio acero hierro pvc cpvc pead ppr polietileno plastico`.replace(/\s+/g, ' ')));
+// Detalles secundarios (mango, color, acabado, forma): pesan poco.
+const QUAL_WEAK = new Set(tokenize(`madera fibra vidrio goma silicona nylon cromado niquelado pavonado profesional pesado liviano blanco negro rojo azul
+  verde amarillo gris marron satinado mate brillante phillips estrella torx allen hexagonal plano redondo cuadrado hembra macho`.replace(/\s+/g, ' ')));
 function prepItem(it) {
   it.tokSet = new Set(tokenize(it.desc));
+  // La marca escrita dentro de la descripción no debe pesar en el cruce (se compara aparte).
+  if (it.brand) for (const t of tokenize(it.brand)) if (!/^\d/.test(t)) it.tokSet.delete(t);
+  it.quals = [...it.tokSet].filter(t => QUAL_VARIANT.has(t) || (t.startsWith('anti') && t.length > 5));
+  it.mats = [...it.tokSet].filter(t => QUAL_MATERIAL.has(t));
+  it.qualsW = [...it.tokSet].filter(t => QUAL_WEAK.has(t));
   it.nums = new Set([...it.tokSet].filter(t => /^\d/.test(t)));
   it.brandN = baseNorm(it.brand).replace(/[^a-z0-9]/g, '');
   it.codeN = baseNorm(it.code).replace(/[^a-z0-9]/g, '');
@@ -284,7 +297,8 @@ function pairScore(a, b) {
   for (const t of a.tokSet) { const w = IDF(t); wa += w; if (b.tokSet.has(t)) sw += w; }
   for (const t of b.tokSet) wb += IDF(t);
   if (!wa || !wb) return 0;
-  let s = 2 * sw / (wa + wb);
+  // Mezcla de similitud total y de contención: una descripción corta contenida en una larga y detallada sigue siendo parecida.
+  let s = 0.5 * (2 * sw / (wa + wb)) + 0.5 * (sw / Math.min(wa, wb));
   const na = a.nums, nb = b.nums;
   if (na.size || nb.size) {
     if (na.size && nb.size) {
@@ -294,6 +308,15 @@ function pairScore(a, b) {
       else s *= 0.55;
     } else { const only = na.size ? na : nb; s *= (only.size === 1 && only.has('1')) ? 0.95 : 0.8; }
   }
+  // Características distintivas (antichispas, inoxidable, material, color, tipo…): si una la tiene y la otra no, casi seguro no son el mismo producto.
+  let qm = 0, qw = 0;
+  for (const t of a.quals) if (!b.tokSet.has(t)) qm++;
+  for (const t of b.quals) if (!a.tokSet.has(t)) qm++;
+  if (a.mats.length && b.mats.length && !a.mats.some(t => b.mats.includes(t))) qm++;
+  for (const t of a.qualsW) if (!b.tokSet.has(t)) qw++;
+  for (const t of b.qualsW) if (!a.tokSet.has(t)) qw++;
+  if (qm) s *= Math.pow(0.4, Math.min(qm, 3));
+  if (qw) s *= Math.pow(0.93, Math.min(qw, 4));
   if (a.brandN && b.brandN) {
     if (a.brandN === b.brandN || a.brandN.includes(b.brandN) || b.brandN.includes(a.brandN)) s = Math.min(1, s + 0.05);
     else s *= G().allowBrands ? 0.9 : 0.45;
@@ -302,6 +325,30 @@ function pairScore(a, b) {
   return s;
 }
 const AUTO_THR = 0.72, MIN_THR = 0.5;
+// Precio comparable por unidad (lista, con IVA y descuentos comerciales, en USD a tu tasa). Sirve para detectar cruces sin sentido.
+function basePriceUSD(it) {
+  const sup = S.suppliers.find(x => x.id === it.sid); if (!sup) return NaN;
+  return it.price / itemPack(it) * cascadeF(sup.discounts) * ivaF(sup) * toUSDF(sup.listCurrency);
+}
+function priceRatio(a, b) {
+  const pa = basePriceUSD(a), pb = basePriceUSD(b);
+  if (!(pa > 0) || !(pb > 0) || !isFinite(pa) || !isFinite(pb)) return null;
+  return Math.max(pa, pb) / Math.min(pa, pb);
+}
+// Penaliza cruces cuyo precio es demasiado distinto: un mismo producto no suele costar el doble o más en otro proveedor.
+function priceFactor(a, b) {
+  const r = priceRatio(a, b);
+  if (r == null) return 1;
+  if (r > 4) return 0.3;
+  if (r > 2.5) return 0.55;
+  if (r > 1.8) return 0.85;
+  return 1;
+}
+const PRICE_ALERT = 2;
+function groupPriceRatio(g) {
+  const v = g.members.map(m => basePriceUSD(m.it)).filter(x => x > 0 && isFinite(x));
+  return v.length > 1 ? Math.max(...v) / Math.min(...v) : null;
+}
 
 function activeSups() { return S.suppliers.filter(s => s.active !== false && S.catalogs[s.id]?.items?.length); }
 function computeMatches() {
@@ -334,7 +381,7 @@ function computeMatches() {
       if (S.decisions.ok[pk]) best = 2;
     }
     if (best === 2) return 2;
-    for (const m of g.members) best = Math.max(best, pairScore(it, m.it));
+    for (const m of g.members) best = Math.max(best, pairScore(it, m.it) * priceFactor(it, m.it));
     return best;
   };
   const newGroup = (it, sid) => {
@@ -384,6 +431,8 @@ function computeMatches() {
       g.status = g.conf >= 2 ? 'ok' : g.conf >= AUTO_THR ? 'hi' : 'dud';
     }
     g.bySid = {}; for (const m of g.members) g.bySid[m.sid] = m.it;
+    g.pr = g.members.length > 1 ? groupPriceRatio(g) : null;
+    g.priceAlert = g.pr != null && g.pr > PRICE_ALERT;
   }
   M = {groups, itemGroup, index, df, sups: ordered, all, groupScore};
   matchDirty = false; UI.planDirty = true;
@@ -964,7 +1013,7 @@ function progressBox(title) {
 const FIELD_DEFS = [
   {f: 'desc', label: 'Descripción *', kw: ['descripcion','producto','articulo','nombre','detalle','item','concepto']},
   {f: 'price', label: 'Precio *', kw: ['precio','mayor','p.v.p','pvp','costo','neto','valor','monto','usd','$','bs','importe','detal']},
-  {f: 'code', label: 'Código del proveedor', kw: ['codigo','cod','ref','referencia','sku','clave','item no']},
+  {f: 'code', label: 'Código del proveedor', kw: ['codigo','cod','ref','referencia','sku','clave','item no','numero de parte','nro de parte','n° de parte','no. de parte','parte','modelo']},
   {f: 'ean', label: 'Código de barras', kw: ['barra','ean','upc','gtin']},
   {f: 'brand', label: 'Marca', kw: ['marca','fabricante','brand']},
   {f: 'unit', label: 'Unidad / presentación', kw: ['unidad','und','u.m','um','empaque','presentacion','medida de venta']},
@@ -978,6 +1027,26 @@ function detectHeader(rows) {
     if (sc > bestScore) { bestScore = sc; best = i; }
   }
   return bestScore > 0 ? best : -1;
+}
+function ivaHint(h) {
+  const t = baseNorm(h);
+  if (/sin\s*i\.?v\.?a|s\/\s*i\.?v\.?a|antes\s+de\s+iva|\bbase\b|\bneto\b|exento|\bmas\s+iva\s+aparte/.test(t)) return false;
+  if (/(con|c\/|\+|mas|incl\w*)\s*\.?\s*i\.?v\.?a|i\.?v\.?a\.?\s*incl|\btotal\b|p\.?v\.?p/.test(t)) return true;
+  return null;
+}
+// Busca dos columnas de precio donde una es la otra × (1 + IVA): esa es la que incluye IVA.
+function ivaPairs(rows, cols) {
+  const f = 1 + G().iva / 100, res = [];
+  for (const i of cols) for (const j of cols) {
+    if (i === j) continue;
+    const r = [];
+    for (const row of rows.slice(0, 200)) { const a = parseNum(row[i]), b = parseNum(row[j]); if (a > 0 && b > 0) r.push(b / a); }
+    if (r.length < 3) continue;
+    r.sort((x, y) => x - y);
+    const med = r[r.length >> 1];
+    if (Math.abs(med - f) < 0.012) res.push({sin: i, con: j});
+  }
+  return res;
 }
 function guessMap(header, rows) {
   const map = {}; const used = new Set();
@@ -1032,24 +1101,31 @@ async function pdfLines(f) {
   return {pdf, pages};
 }
 const AI_HEAD = ['Código','Descripción','Marca','Unidad','Unid. x empaque','Precio','Precio alterno'];
-function aiRowsToSheet(rows, priceNames) {
+function aiRowsToSheet(rows, priceNames, conds) {
   const head = AI_HEAD.slice();
-  if (priceNames?.[0]) head[5] = 'Precio (' + priceNames[0] + ')';
-  if (priceNames?.[1]) head[6] = 'Precio (' + priceNames[1] + ')';
+  const lab = c => { if (!c) return null; if (typeof c === 'string') return c; return (c.nombre || 'Precio') + (c.incluye_iva === true ? ' · con IVA' : c.incluye_iva === false ? ' · sin IVA' : ''); };
+  if (priceNames?.[0]) head[5] = 'Precio (' + lab(priceNames[0]) + ')';
+  if (priceNames?.[1]) head[6] = 'Precio (' + lab(priceNames[1]) + ')';
   const norm = r => Array.isArray(r) ? [r[0] ?? '', r[1] ?? '', r[2] ?? '', r[3] ?? '', r[4] ?? '', r[5] ?? '', r[6] ?? ''] : [r.codigo || '', r.descripcion || '', r.marca || '', r.unidad || '', r.unidades_por_empaque || '', r.precio ?? '', r.precio_alterno ?? ''];
-  return {name: 'Extraído', rows: [head, ...rows.map(norm)]};
+  return {name: 'Extraído', rows: [head, ...rows.map(norm).filter(r => parseNum(r[5]) > 0 || parseNum(r[6]) > 0)], conds: (conds || []).filter(Boolean)};
 }
 const EXTRACT_PROMPT = (what) => `Eres un asistente que extrae listas de precios de proveedores de una ferretería.
 Del siguiente ${what} extrae TODOS los productos que tengan precio. No inventes productos ni precios.
 Responde SOLO con JSON con esta forma:
-{"columnas_precio":["nombre de la 1ra columna de precio","nombre de la 2da si existe"],"filas":[["codigo","descripcion","marca","unidad",unidades_por_empaque,precio,precio_alterno]]}
+{"columnas_precio":[{"nombre":"encabezado de la 1ra columna de precio","incluye_iva":true},{"nombre":"encabezado de la 2da si existe","incluye_iva":false}],"condiciones":["..."],"filas":[["codigo","descripcion","marca","unidad",unidades_por_empaque,precio,precio_alterno]]}
 Cada fila es un arreglo en ese orden exacto (usa "" si un texto no existe). Ejemplo: ["T-12","Tubo PVC 1/2\" x 6 m presión","Pavco","UND",1,3.5,null]
 Reglas:
 - precio y precio_alterno son números con punto decimal (ej. "1.234,56" -> 1234.56). Si solo hay una columna de precio, precio_alterno = null.
 - No agregues explicaciones ni espacios innecesarios en el JSON.
+- IVA: indica en "incluye_iva" si cada columna de precio incluye IVA (true), no lo incluye (false) o no se sabe (null). Encabezados como "Precio + IVA", "Precio con IVA", "c/IVA", "IVA incluido", "P.V.P." o "Total" = incluye IVA. "Sin IVA", "s/IVA", "Base", "Neto" = no incluye. Lee también las notas de la lista (ej. "precios incluyen IVA"). Si hay dos columnas y una es la otra × 1,16, la mayor incluye IVA.
+- precio corresponde a la 1ra columna de "columnas_precio" y precio_alterno a la 2da, en ese mismo orden.
 - "descripcion" completa con medidas y especificaciones (ej. 'Tubo PVC 1/2" x 6 m presión').
 - Si la descripción o unidad indica caja/paquete con N unidades, pon N en unidades_por_empaque; si no, 1.
 - Si un encabezado de sección (categoría o marca) aplica a varias filas, inclúyelo en la descripción o la marca.
+- Si un producto tiene un título, una lista de características y una tabla de tamaños/modelos con su propio número de parte y precio, crea UNA fila por cada fila de la tabla. Su descripción = título + la característica que define la versión (ej. antichispas, inoxidable, a prueba de explosión) + material principal y mango si se indican + el tamaño de esa fila. Ej: "Mandarria antichispas 20 lb, aluminio-bronce, mango fibra de vidrio". El código es el número de parte de esa fila. No incluyas frases de publicidad ni el tipo de empaque.
+- Ignora filas con precio 0, vacío o "consultar".
+- Si hay una columna de precio que ya trae restado un descuento por pronto pago u otra condición (ej. "Precio - 4% PP + IVA"), NO la uses como precio: usa el precio con IVA sin ese descuento y anota la condición en "condiciones".
+- En "condiciones" anota descuentos o condiciones de pago que mencione la lista (ej. "4% pronto pago", "precios en dólares a tasa BCV", "precios no incluyen IVA").
 - Ignora encabezados, totales, condiciones y textos sin precio.`;
 const AI_PARALLEL = 4;
 async function pool(items, n, fn) {
@@ -1066,6 +1142,7 @@ async function aiExtractPDF(f, pagesLines, pdf) {
   if (scanned && !SAMPLE_IMG) { toast('Este PDF parece escaneado: agrega tu clave de Claude en Ajustes para poder leerlo.'); return null; }
   const prog = progressBox('Claude está leyendo el catálogo');
   let priceNames = null, done = 0;
+  const conds = new Set();
   const failed = [];
   const t0 = Date.now();
   const tick = (total, unit) => {
@@ -1088,7 +1165,7 @@ async function aiExtractPDF(f, pagesLines, pdf) {
         if (prog.cancelled) throw {code: 'cancelled'};
         try {
           const r = await askJSON(EXTRACT_PROMPT('texto (extraído de un PDF; las columnas están separadas por |)') + '\n\nTEXTO:\n' + c.t, {effort: 'low'});
-          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
+          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio; (r.condiciones || []).forEach(c => c && conds.add(String(c)));
           return r.filas || [];
         } catch (e) { if (FATAL(e)) throw e; failed.push(c.from === c.to ? `${c.from}` : `${c.from}–${c.to}`); return []; }
         finally { if (!prog.cancelled) tick(chunks.length, 'partes'); }
@@ -1105,7 +1182,7 @@ async function aiExtractPDF(f, pagesLines, pdf) {
           await page.render({canvasContext: cv.getContext('2d'), viewport: vp}).promise;
           const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
           const r = await askJSON(EXTRACT_PROMPT('imagen de una página de catálogo'), {images: [blob], effort: 'low'});
-          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
+          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio; (r.condiciones || []).forEach(c => c && conds.add(String(c)));
           return r.filas || [];
         } catch (e) { if (FATAL(e)) throw e; failed.push(String(p)); return []; }
         finally { if (!prog.cancelled) tick(pages.length, 'páginas'); }
@@ -1114,7 +1191,7 @@ async function aiExtractPDF(f, pagesLines, pdf) {
     prog.close();
     const rows = parts.flat();
     if (failed.length) toast(`No se pudieron leer las páginas ${failed.sort((a, b) => parseInt(a) - parseInt(b)).join(', ')}. Revisa la vista previa o vuelve a intentarlo.`, 8000);
-    return [aiRowsToSheet(rows, priceNames)];
+    return [aiRowsToSheet(rows, priceNames, [...conds])];
   } catch (e) { prog.close(); if (e?.code !== 'cancelled') toast(aiErr(e), 5000); return null; }
 }
 function basicPDFSheet(pagesLines) {
@@ -1159,7 +1236,7 @@ async function importFile(f) {
       prog.set(.3, 'Analizando la imagen…');
       try {
         const r = await askJSON(EXTRACT_PROMPT('imagen (foto o captura de una lista de precios)'), {images: [f], effort: 'low'});
-        prog.close(); sheets = [aiRowsToSheet(r.filas || [], r.columnas_precio)];
+        prog.close(); sheets = [aiRowsToSheet(r.filas || [], r.columnas_precio, r.condiciones)];
       } catch (e) { prog.close(); toast(aiErr(e), 5000); return; }
     } else { toast('Formato no soportado: ' + f.name); return; }
   } catch (e) { console.error(e); toast('No se pudo leer ' + f.name + ': ' + (e.message || e), 5000); return; }
@@ -1185,7 +1262,9 @@ function mappingDialog(fname, sheets) {
         <label class="f">Si ya tiene catálogo<select data-mode><option value="replace">Reemplazarlo por este</option><option value="add">Agregar estos productos</option></select></label>
         ${sheets.length > 1 ? `<label class="f">Hoja<select data-sheet>${sheets.map((s, i) => `<option value="${i}" ${i === si ? 'selected' : ''}>${esc(s.name)} (${s.rows.length} filas)</option>`).join('')}</select></label>` : ''}
         <label class="f">Fila de encabezados<input type="number" min="0" data-hdr class="num" style="width:100%"><span class="h">0 = sin encabezados</span></label>
+        <label class="f">El precio elegido…<select data-iva><option value="1">ya incluye IVA</option><option value="0">no incluye IVA (se le sumará)</option></select><span class="h" data-ivahint></span></label>
       </div>
+      ${sheets.some(x => x.conds?.length) ? `<div class="note warn" style="margin-bottom:10px"><b>La lista menciona estas condiciones:</b> ${sheets.flatMap(x => x.conds || []).map(esc).join(' · ')}<br><span class="small">Anota los descuentos de pago (por ejemplo, pronto pago) como plazos en <b>Proveedores y pagos</b>, no restados del precio, para que no se apliquen dos veces.</span></div>` : ''}
       <h3 style="margin:6px 0">Columnas</h3>
       <div class="grid g2 sel-cols" data-cols></div>
       <h3 style="margin:14px 0 6px">Vista previa <span class="tiny" data-count></span></h3>
@@ -1198,15 +1277,40 @@ function mappingDialog(fname, sheets) {
       const h = detectHeader(rows); hdr = h;
       const header = h >= 0 ? rows[h] : rows[0].map((_, i) => 'Columna ' + (i + 1));
       map = guessMap(header.map(String), rows.slice(h + 1));
+      preferIvaCol();
       el.querySelector('[data-hdr]').value = h + 1;
       drawCols();
+    };
+    let ivaTouched = false;
+    // Si hay varias columnas de precio, prefiere la que dice incluir IVA.
+    const preferIvaCol = () => {
+      const H = header(), rows = rowsOf().slice(hdr + 1);
+      const priceCols = H.map((h, i) => i).filter(i => FIELD_DEFS[1].kw.some(k => baseNorm(H[i]).includes(k)) || /i\.?v\.?a/.test(baseNorm(H[i])));
+      const con = priceCols.find(i => ivaHint(H[i]) === true);
+      if (con != null) { map.price = con; return; }
+      const pr = ivaPairs(rows, priceCols.length >= 2 ? priceCols : H.map((h, i) => i));
+      if (pr.length && (map.price == null || map.price === pr[0].sin || map.price === pr[0].con)) map.price = pr[0].con;
+    };
+    const updateIva = () => {
+      if (map.price == null) return;
+      const H = header(), rows = rowsOf().slice(hdr + 1);
+      let v = ivaHint(H[map.price]), why = '';
+      if (v != null) why = `Según el encabezado «${H[map.price]}».`;
+      else {
+        const pr = ivaPairs(rows, H.map((h, i) => i));
+        if (pr.some(p => p.con === map.price)) { v = true; why = `Esta columna es otra × ${nf2.format(1 + G().iva / 100)}: incluye IVA.`; }
+        else if (pr.some(p => p.sin === map.price)) { v = false; why = `Otra columna es esta × ${nf2.format(1 + G().iva / 100)}: esta es sin IVA.`; }
+      }
+      if (v == null) { const sel = S.suppliers.find(x => x.id === supSel.value); v = sel ? sel.ivaIncluded !== false : true; why = 'No se pudo detectar: revisa y elige.'; }
+      if (!ivaTouched) el.querySelector('[data-iva]').value = v ? '1' : '0';
+      el.querySelector('[data-ivahint]').textContent = why;
     };
     const header = () => { const rows = rowsOf(); const w = Math.max(...rows.slice(0, 80).map(r => r.length)); return Array.from({length: w}, (_, i) => hdr >= 0 ? String(rows[hdr][i] ?? '') || 'Columna ' + (i + 1) : 'Columna ' + (i + 1)); };
     const drawCols = () => {
       const H = header();
       el.querySelector('[data-cols]').innerHTML = FIELD_DEFS.map(d => `<label class="f">${d.label}<select data-f="${d.f}"><option value="">— no tiene —</option>${H.map((h, i) => `<option value="${i}" ${map[d.f] === i ? 'selected' : ''}>${esc(h.slice(0, 40))}</option>`).join('')}</select></label>`).join('');
-      el.querySelectorAll('[data-f]').forEach(s => s.onchange = () => { map[s.dataset.f] = s.value === '' ? undefined : +s.value; drawPv(); });
-      drawPv();
+      el.querySelectorAll('[data-f]').forEach(s => s.onchange = () => { map[s.dataset.f] = s.value === '' ? undefined : +s.value; if (s.dataset.f === 'price') ivaTouched = false; updateIva(); drawPv(); });
+      updateIva(); drawPv();
     };
     const buildItems = () => {
       const rows = rowsOf().slice(hdr + 1);
@@ -1232,6 +1336,7 @@ function mappingDialog(fname, sheets) {
         (items.length ? '' : `<tr><td colspan="6" class="muted">Ninguna fila tiene descripción y precio válidos con este mapeo. Ajusta las columnas o la fila de encabezados.</td></tr>`);
     };
     const supSel = el.querySelector('[data-sup]');
+    el.querySelector('[data-iva]').onchange = () => { ivaTouched = true; };
     const syncSup = () => {
       const isNew = supSel.value === '__new';
       el.querySelector('[data-newwrap]').style.display = isNew ? '' : 'none';
@@ -1252,6 +1357,15 @@ function mappingDialog(fname, sheets) {
       const mode = el.querySelector('[data-mode]').value;
       const cat = S.catalogs[sup.id] || (S.catalogs[sup.id] = {files: [], items: []});
       if (mode === 'replace') { cat.items = []; cat.files = []; }
+      const withIva = el.querySelector('[data-iva]').value === '1';
+      if (mode === 'replace' || !cat.items.length) {
+        if (sup.ivaIncluded !== withIva) toast(`${sup.name}: precios marcados como ${withIva ? 'con IVA incluido' : 'sin IVA (se sumará el ' + nf2.format(G().iva) + '%)'}.`, 5000);
+        sup.ivaIncluded = withIva; saveConfig();
+      } else if (sup.ivaIncluded !== withIva) {
+        // Se agregan a un catálogo que usa la otra convención: se ajusta el precio para que todo quede igual.
+        const f = 1 + G().iva / 100;
+        for (const it of items) it.price = withIva ? it.price / f : it.price * f;
+      }
       const keys = new Set(cat.items.map(i => i.k));
       const byKey = new Map(cat.items.map(i => [i.k, i]));
       for (const it of items) {
@@ -1451,13 +1565,15 @@ function renderComp() {
   ensureMatches();
   const supMap = Object.fromEntries(S.suppliers.map(s => [s.id, s]));
   const cols = M.sups;
-  const counts = {match: 0, dud: 0, one: 0, qty: 0};
-  for (const g of M.groups) { if (g.status !== 'one') counts.match++; if (g.status === 'dud') counts.dud++; if (g.status === 'one') counts.one++; if (groupQty(g) > 0) counts.qty++; }
+  const counts = {match: 0, dud: 0, one: 0, qty: 0, unv: 0, pa: 0};
+  for (const g of M.groups) { if (g.status !== 'one') counts.match++; if (g.status === 'dud') counts.dud++; if (g.status === 'hi' || g.status === 'dud') counts.unv++; if (g.priceAlert) counts.pa++; if (g.status === 'one') counts.one++; if (groupQty(g) > 0) counts.qty++; }
   const q = tokenize(UI.compSearch);
   const qs = baseNorm(UI.compSearch).trim();
   let list = M.groups.filter(g => {
     if (UI.compFilter === 'match' && g.status === 'one') return false;
     if (UI.compFilter === 'dud' && g.status !== 'dud') return false;
+    if (UI.compFilter === 'unv' && g.status !== 'hi' && g.status !== 'dud') return false;
+    if (UI.compFilter === 'pa' && !g.priceAlert) return false;
     if (UI.compFilter === 'one' && g.status !== 'one') return false;
     if (UI.compFilter === 'qty' && !(groupQty(g) > 0)) return false;
     if (qs) return g.members.some(m => q.every(t => m.it.tokSet.has(t) || [...m.it.tokSet].some(x => x.startsWith(t))) || baseNorm(m.it.code).includes(qs) || baseNorm(m.it.desc).includes(qs));
@@ -1474,7 +1590,7 @@ function renderComp() {
   <div class="small muted" style="margin-bottom:10px">Comparando ${activeSups().length} catálogos: ${activeSups().map(s => `<span class="row" style="display:inline-flex;gap:4px;margin-right:8px"><span class="dot" style="background:${supColor(s.id)}"></span>${esc(s.name)}</span>`).join('')} <button class="btn sm ghost" data-goto="cat">Cambiar</button></div>
   <div class="stats">
     <div class="stat hl"><div class="v">${nf0.format(counts.match)}</div><div class="l">productos cruzados entre 2 o más proveedores</div></div>
-    <div class="stat"><div class="v">${nf0.format(counts.dud)}</div><div class="l">coincidencias dudosas por revisar</div></div>
+    <div class="stat"><div class="v">${nf0.format(counts.unv)}</div><div class="l">cruces sin verificar (${nf0.format(counts.dud)} dudosos${counts.pa ? `, <b style="color:var(--bad)">${nf0.format(counts.pa)} con precio sospechoso</b>` : ''})</div></div>
     <div class="stat"><div class="v">${ng ? nf2.format(avgGap / ng * 100) + '%' : '—'}</div><div class="l">diferencia promedio entre el más barato y el siguiente</div></div>
     <div class="stat"><div class="v small" style="font-size:14px;line-height:1.5">${Object.entries(wins).sort((a, b) => b[1] - a[1]).map(([sid, n]) => `<span class="row" style="gap:6px"><span class="dot" style="background:${supColor(sid)}"></span>${esc(supName(sid))}: <b>${nf0.format(n)}</b></span>`).join('') || '—'}</div><div class="l">productos donde cada uno es el más barato</div></div>
   </div>
@@ -1482,12 +1598,14 @@ function renderComp() {
     <input type="text" id="compSearch" placeholder="Buscar producto o código…" value="${esc(UI.compSearch)}" style="flex:1;min-width:200px">
     <select id="compFilter">
       <option value="match" ${UI.compFilter === 'match' ? 'selected' : ''}>Cruzados (${nf0.format(counts.match)})</option>
+      <option value="unv" ${UI.compFilter === 'unv' ? 'selected' : ''}>Sin verificar (${nf0.format(counts.unv)})</option>
+      <option value="pa" ${UI.compFilter === 'pa' ? 'selected' : ''}>Precio sospechoso (${nf0.format(counts.pa)})</option>
       <option value="dud" ${UI.compFilter === 'dud' ? 'selected' : ''}>Dudosos (${nf0.format(counts.dud)})</option>
       <option value="one" ${UI.compFilter === 'one' ? 'selected' : ''}>Sin pareja (${nf0.format(counts.one)})</option>
       <option value="qty" ${UI.compFilter === 'qty' ? 'selected' : ''}>En mi pedido (${nf0.format(counts.qty)})</option>
       <option value="all" ${UI.compFilter === 'all' ? 'selected' : ''}>Todos (${nf0.format(M.groups.length)})</option>
     </select>
-    <button class="btn ai" data-act="aireview" ${counts.dud ? '' : 'disabled'} title="${SAMPLE ? '' : 'Requiere tu clave de Claude (Ajustes)'}">✦ Revisar dudosos con Claude</button>
+    <button class="btn ai" data-act="aireview" ${counts.unv ? '' : 'disabled'} title="${SAMPLE ? 'Claude lee descripciones, especificaciones, marca y precio de cada cruce' : 'Requiere tu clave de Claude (Ajustes)'}">✦ Verificar cruces con Claude</button>
     <button class="btn ai" data-act="aifind" ${counts.one ? '' : 'disabled'} title="${SAMPLE ? '' : 'Requiere tu clave de Claude (Ajustes)'}">✦ Buscar parejas con Claude</button>
   </div>
   <div class="row small muted" style="margin-bottom:10px">
@@ -1500,7 +1618,7 @@ function renderComp() {
   <div class="tw"><table>
     <tr><th>Producto</th>${cols.map(s => `<th class="r"><span class="row" style="gap:6px;justify-content:flex-end"><span class="dot" style="background:${supColor(s.id)}"></span>${esc(s.name)}</span></th>`).join('')}<th class="r">Diferencia</th><th>Cruce</th><th class="r">Cantidad</th></tr>
     ${shown.map(({g, costs, bestSid, gap}) => {
-      const tag = {ok: '<span class="tag ok">Confirmado</span>', hi: '<span class="tag hi">Alta</span>', dud: '<span class="tag dud">Dudoso</span>', one: '<span class="tag one">Sin pareja</span>'}[g.status];
+      const tag = {ok: '<span class="tag ok">Verificado</span>', hi: '<span class="tag hi" title="Muy parecidos, pero nadie lo ha verificado">Probable</span>', dud: '<span class="tag dud">Dudoso</span>', one: '<span class="tag one">Sin pareja</span>'}[g.status];
       const open = UI.openGroup === g.id;
       return `<tr class="clk" data-act="opengroup" data-g="${g.id}">
         <td style="max-width:360px">${esc(g.anchor.desc)}${g.anchor.brand ? ` <span class="tiny">· ${esc(g.anchor.brand)}</span>` : ''}</td>
@@ -1509,7 +1627,7 @@ function renderComp() {
           return `<td class="r mono ${s.id === bestSid && Object.keys(costs).length > 1 ? 'best' : ''}" title="${esc(it.desc)}\nLista: ${fmtCur(it.price, s.listCurrency)}${itemPack(it) > 1 ? ' por ' + itemPack(it) + ' und' : ''}\nMejor pago: ${esc(c?.method?.name || '')}">${c ? fmtShowU(c.cost) : '—'}${itemPack(it) > 1 ? `<div class="tiny">emp. ${itemPack(it)}</div>` : ''}</td>`;
         }).join('')}
         <td class="r mono">${gap != null ? nf2.format(gap * 100) + '%' : ''}</td>
-        <td>${tag}</td>
+        <td>${tag}${g.priceAlert ? ` <span class="tag bad" title="El precio por unidad de uno es ${nf2.format(g.pr)} veces el del otro. Revisa si de verdad es el mismo producto, si el empaque (caja vs unidad) está bien o si se tomó la columna de precio correcta.">⚠ precio ×${nf2.format(g.pr)}</span>` : ''}</td>
         <td class="r" data-stop="1"><input type="text" inputmode="decimal" class="num tbl" style="width:70px" data-qty="${g.id}" value="${groupQty(g) || ''}" placeholder="0"></td>
       </tr>${open ? renderGroupDetail(g, supMap) : ''}`;
     }).join('')}
@@ -1533,9 +1651,12 @@ function renderGroupDetail(g, supMap) {
       }).join('')}
     </table>
     <div class="row" style="margin-top:8px">
-      ${g.status === 'dud' || g.status === 'hi' ? `<button class="btn sm" data-act="confirm" data-g="${g.id}">✓ Confirmar que son el mismo producto</button>` : ''}
+      ${g.status === 'dud' || g.status === 'hi' ? `<button class="btn sm" data-act="confirm" data-g="${g.id}">✓ Sí, son el mismo producto</button>` : ''}
       <button class="btn sm" data-act="link" data-g="${g.id}">+ Vincular otro producto manualmente</button>
       <span class="tiny">Si un proveedor vende por caja y otro por unidad, ajusta «Unid. x empaque» para comparar por unidad.</span>
+    </div>
+    ${g.priceAlert ? `<div class="note bad small" style="margin-top:8px">⚠ El precio por unidad de uno es <b>${nf2.format(g.pr)} veces</b> el del otro. Un mismo producto no suele costar tan distinto: revisa si es una versión diferente (ej. antichispas, industrial), si el empaque está bien (caja vs unidad) o si se tomó la columna de precio equivocada (con/sin IVA). Si no son el mismo, pulsa <b>Separar</b>.</div>` : ''}
+    <div>
     </div>
   </td></tr>`;
 }
@@ -1553,6 +1674,8 @@ function renderPlan() {
   const bestSingle = singles[0];
   const saving = bestSingle && bestSingle.score < 1e9 ? bestSingle.score - totalPV : null;
   const warns = [];
+  const unv = lines.filter(l => l.opts.length > 1 && (l.g.status === 'hi' || l.g.status === 'dud')).length;
+  const pal = lines.filter(l => l.opts.length > 1 && l.g.priceAlert);
   for (const o of orders) {
     if (!o.minOK) warns.push(`<b>${esc(o.sup.name)}</b>: el pedido (${fmtCur(o.net, o.sup.listCurrency)}) no llega al mínimo de ${fmtCur(num(o.sup.minOrder), o.sup.listCurrency)}. Ningún reparto cumple todos los mínimos; agrega productos o quita el mínimo.`);
     if (!o.best) warns.push(`<b>${esc(o.sup.name)}</b>: ningún método de pago es válido (${esc(o.methods.map(x => x.m.name + ': ' + (x.why || '')).join('; '))}).`);
@@ -1566,6 +1689,8 @@ function renderPlan() {
     <div class="stat"><div class="v">${nf0.format(lines.length)}</div><div class="l">productos en el pedido</div></div>
   </div>
   ${warns.length ? `<div class="note bad" style="margin-bottom:12px">${warns.join('<br>')}</div>` : ''}
+  ${pal.length ? `<div class="note bad row" style="margin-bottom:12px"><span><b>${pal.length}</b> producto(s) del pedido tienen precios muy distintos entre proveedores (más del doble): ${pal.slice(0, 4).map(l => esc(l.g.anchor.desc)).join('; ')}${pal.length > 4 ? '…' : ''}. Revisa que de verdad sean el mismo producto antes de pedir.</span><span class="spacer"></span><button class="btn sm" data-act="gopa">Revisar</button></div>` : ''}
+  ${unv ? `<div class="note warn row" style="margin-bottom:12px"><span><b>${unv}</b> producto(s) del pedido se comparan con cruces que nadie ha verificado. Un cruce equivocado (por ejemplo, una versión especial contra una normal) puede cambiar el resultado.</span><span class="spacer"></span><button class="btn sm ai" data-act="aireview">✦ Verificar con Claude</button><button class="btn sm" data-goto="comp">Revisar a mano</button></div>` : ''}
   <div class="row" style="margin-bottom:12px"><span class="muted small">El reparto prueba todas las combinaciones de proveedores, aplica mínimos, escalas, fletes y límites, y elige el método de pago más barato para cada pedido.</span><span class="spacer"></span>
     <button class="btn" data-act="recalc">Recalcular</button><button class="btn pri" data-act="export">Descargar Excel</button></div>
   ${orders.map(o => renderOrder(o)).join('')}
@@ -1733,6 +1858,7 @@ document.addEventListener('click', async e => {
       for (const g of M.groups) {
         if (UI.compFilter === 'match' && g.status === 'one') continue;
         if (UI.compFilter === 'dud' && g.status !== 'dud') continue;
+        if (UI.compFilter === 'unv' && g.status !== 'hi' && g.status !== 'dud') continue;
         if (UI.compFilter === 'one' && g.status !== 'one') continue;
         if (UI.compFilter === 'qty' && !(groupQty(g) > 0)) continue;
         if (qs && !g.members.some(m => q.every(t => m.it.tokSet.has(t) || [...m.it.tokSet].some(x => x.startsWith(t))) || baseNorm(m.it.code).includes(qs) || baseNorm(m.it.desc).includes(qs))) continue;
@@ -1762,7 +1888,8 @@ document.addEventListener('click', async e => {
       catch (err) { const m = openModal(`<h2>Pedido para ${esc(o.sup.name)}</h2><p class="muted small">Selecciona y copia el texto:</p><textarea style="width:100%;height:260px">${esc(txt)}</textarea><div class="ft"><button class="btn" data-x>Cerrar</button></div>`); m.el.querySelector('[data-x]').onclick = m.close; m.el.querySelector('textarea').select(); }
       break;
     }
-    case 'aireview': aiReview(); break;
+    case 'gopa': UI.tab = 'comp'; UI.compFilter = 'pa'; UI.compLimit = 100; render(); window.scrollTo(0, 0); break;
+    case 'aireview': await aiReview(); UI.planDirty = true; if (UI.tab === 'plan') render(); break;
     case 'aifind': aiFind(); break;
   }
 });
@@ -1814,7 +1941,14 @@ function linkDialog(g) {
 }
 
 /* ================= Claude: revisar cruces ================= */
-const fmtItemAI = (it) => `"${it.desc}"${it.brand ? ` marca ${it.brand}` : ''}${it.unit ? ` (unidad: ${it.unit})` : ''}`;
+const fmtItemAI = (it) => { const sup = S.suppliers.find(x => x.id === it.sid); const pk = itemPack(it);
+  return `"${it.desc}"${it.brand ? ` · marca ${it.brand}` : ''}${it.code ? ` · cód. ${it.code}` : ''}${it.unit ? ` · unidad: ${it.unit}` : ''} · precio lista ${fmtCur(it.price, sup?.listCurrency || 'USD')}${pk > 1 ? ` por ${pk} und` : ''}`; };
+const STRICT_RULES = `Cómo decidir:
+- Primero compara el tipo de producto, la medida/peso/tamaño y la versión. Si coinciden y nada se contradice, SÍ son equivalentes aunque cambie la marca y aunque una descripción sea mucho más detallada que la otra (ej. "Mandarria con mango 2 lb" vs "Mandarria mango de fibra de vidrio 2 lb, cabeza de acero al carbono" → SÍ).
+- NO son el mismo si uno es una VERSIÓN ESPECIAL que el otro no es: antichispas, a prueba de explosión, inoxidable, galvanizado, industrial, eléctrico/inalámbrico vs manual, aislado/dieléctrico, de presión vs sanitario, etc. (ej. "Mandarria 20 lb" vs "Mandarria antichispas 20 lb, aluminio-bronce" → NO).
+- NO son el mismo si algún dato se CONTRADICE: distinta medida, peso, largo, calibre, voltaje, potencia, capacidad, rosca, número de piezas, o materiales declarados distintos en ambas descripciones.
+- El precio es una pista: si el precio por unidad de uno es más del doble que el del otro y no se explica por la presentación, probablemente son productos distintos (versión especial o calidad muy distinta).
+- Si de verdad no hay información para decidir, NO.`;
 const EQUIV_RULE = () => G().allowBrands
   ? 'Cuentan como iguales si son el mismo producto o un equivalente directo e intercambiable (misma función, tipo, medida, material y especificación) aunque cambie la marca.'
   : 'Solo cuentan como iguales si son el mismo producto de la misma marca y especificación.';
@@ -1822,9 +1956,10 @@ async function aiReview() {
   if (!SAMPLE) { toast('Agrega tu clave de la API de Claude en Ajustes.'); settingsDialog(); return; }
   ensureMatches();
   const pairs = [];
-  for (const g of M.groups) if (g.status === 'dud') for (const m of g.members.slice(1)) if (m.score < AUTO_THR) pairs.push({a: g.anchor, b: m.it});
+  for (const g of M.groups) if (g.status === 'hi' || g.status === 'dud') for (const m of g.members.slice(1)) if (!S.decisions.ok[pairKey(g.anchor.k, m.it.k)]) pairs.push({a: g.anchor, b: m.it});
   if (!pairs.length) return;
-  const prog = progressBox(`Claude está revisando ${pairs.length} coincidencias dudosas`);
+  if (pairs.length > 60 && !await confirmBox('Verificar cruces con Claude', `Claude revisará <b>${nf0.format(pairs.length)}</b> cruces leyendo descripción, especificaciones, marca y precio. Con Haiku cuesta alrededor de ${nf2.format(pairs.length / 30 * 0.002)} USD; con Sonnet, unos ${nf2.format(pairs.length / 30 * 0.02)} USD.`, 'Verificar')) return;
+  const prog = progressBox(`Claude está verificando ${pairs.length} cruces`);
   let yes = 0, no = 0;
   try {
     const batches = []; for (let i = 0; i < pairs.length; i += 30) batches.push(pairs.slice(i, i + 30));
@@ -1833,11 +1968,11 @@ async function aiReview() {
       if (prog.cancelled) return;
       const prompt = `Eres experto en productos de ferretería. Compara cada par de productos de dos proveedores distintos y decide si son el mismo producto.
 ${EQUIV_RULE()}
-Diferencias de medida, diámetro, calibre, longitud, voltaje, potencia, capacidad, rosca, material o tipo significan que NO son iguales.
+${STRICT_RULES}
 Si solo cambia la presentación (uno por unidad y otro en caja/paquete de N), sí son iguales: indica en "emp_a"/"emp_b" cuántas unidades trae cada presentación.
 Responde SOLO JSON: {"r":[{"id":1,"igual":true,"emp_a":1,"emp_b":1}]}
 Pares:
-${batch.map((p, j) => `${j + 1}. A: ${fmtItemAI(p.a)} | B: ${fmtItemAI(p.b)}`).join('\n')}`;
+${batch.map((p, j) => { const r = priceRatio(p.a, p.b); return `${j + 1}. A: ${fmtItemAI(p.a)} | B: ${fmtItemAI(p.b)}${r ? ` | precio por unidad: uno es ${nf2.format(r)} veces el otro` : ''}`; }).join('\n')}`;
       let r; try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
       finally { doneB++; if (!prog.cancelled) prog.set(doneB / batches.length, `Revisados ${Math.min(doneB * 30, pairs.length)} de ${pairs.length}…`); }
       if (prog.cancelled) return;
@@ -1854,7 +1989,7 @@ ${batch.map((p, j) => `${j + 1}. A: ${fmtItemAI(p.a)} | B: ${fmtItemAI(p.b)}`).j
     prog.close();
   } catch (e) { prog.close(); toast(aiErr(e), 5000); }
   matchDirty = true; saveConfig(); render();
-  if (yes + no) toast(`Claude confirmó ${yes} y separó ${no} coincidencias.`, 4500);
+  if (yes + no) toast(`Claude verificó ${yes} cruces como el mismo producto y separó ${no} que no lo son.`, 5000);
 }
 async function aiFind() {
   if (!SAMPLE) { toast('Agrega tu clave de la API de Claude en Ajustes.'); settingsDialog(); return; }
@@ -1885,7 +2020,8 @@ async function aiFind() {
       if (prog.cancelled) return;
       const prompt = `Eres experto en productos de ferretería. Para cada producto, indica cuál de sus candidatos (de otro proveedor) es el mismo producto, o null si ninguno lo es.
 ${EQUIV_RULE()}
-Diferencias de medida, calibre, longitud, voltaje, capacidad, rosca, material o tipo significan que NO es el mismo. Si solo cambia la presentación (unidad vs caja de N), sí es el mismo.
+${STRICT_RULES}
+Si solo cambia la presentación (unidad vs caja de N), sí es el mismo.
 Responde SOLO JSON: {"r":[{"id":1,"elegido":2}]}  (elegido = número del candidato o null)
 ${batch.map((t, j) => `${j + 1}. Producto: ${fmtItemAI(t.it)}\n${t.cands.map((c, k) => `   ${k + 1}) ${fmtItemAI(c.it)}`).join('\n')}`).join('\n')}`;
       let r; try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
