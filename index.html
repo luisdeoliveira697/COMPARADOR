@@ -232,14 +232,16 @@ function newSupplier(name, cur = 'USD') {
 const STOP = new Set(['de','del','para','con','el','la','los','las','y','en','tipo','marca','ref','cod','codigo','und','unid','unidad','unidades','pza','pzas','pieza','piezas','u','un','una','al','por','a','sin','mod','modelo','art','x','c/u','cu']);
 function baseNorm(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
 const PACK_RES = [
-  /\b(?:caja|cja|cj|paquete|paq|pqt|bolsa|blister|bulto|display|rollo|saco|juego|kit|set)\s*(?:de|x|c\/)?\s*(\d{1,5})\s*(?:und|unds|unid|unidades|u|pzas?|piezas?)?\b/,
+  /\b(?:caja|cajas|cja|cj|paquete|paq|pqt|bolsa|bolsita|blister|display|rollo|saco|estuche|tubo de|frasco de)\s*(?:de|con|x|c\/)?\s*(\d{1,5})\s*(?:und|unds|unid|unidades|u|pzas?|piezas?|uds?)?\b/,
   /\bc\/\s*(\d{1,5})\b/,
   /\bx\s*(\d{1,5})\s*(?:und|unds|unid|unidades|u|pzas?|piezas?)\b/,
-  /\b(\d{1,5})\s*(?:und|unds|unid|unidades|pzas|piezas)\s*(?:x|por)\s*(?:caja|paquete|bolsa|bulto)\b/
+  /\b(\d{1,5})\s*(?:und|unds|unid|unidades|pzas|piezas|uds)\s*(?:x|por|\/)\s*(?:caja|paquete|bolsa|blister|display)\b/
 ];
+const PACK_WORDS = [[/\b(?:caja|paquete|bolsa)?\s*(?:x|de|por)?\s*docena\b/, 12], [/\b(?:x|por|el)?\s*ciento\b/, 100], [/\b(?:x|por|el)?\s*millar\b/, 1000]];
 function detectPack(s) {
   s = baseNorm(s);
   for (const re of PACK_RES) { const m = s.match(re); if (m) { const n = +m[1]; if (n > 1 && n <= 100000) return n; } }
+  for (const [re, n] of PACK_WORDS) if (re.test(s)) return n;
   return 1;
 }
 function normText(s) {
@@ -286,7 +288,7 @@ function tokenize(s) {
 }
 // Versiones especiales: si solo una descripción la tiene, son productos distintos (ej. mandarria antichispas vs mandarria normal).
 const QUAL_VARIANT = new Set(tokenize(`antichispas inoxidable inox galvanizado industrial reforzado electrico inalambrico bateria neumatico hidraulico
-  trifasico monofasico bifasico explosion dielectrico aislado impermeable sanitario presion termofusion soldable cementar roscado`.replace(/\s+/g, ' ')));
+  trifasico monofasico bifasico explosion dielectrico aislado impermeable sanitario presion termofusion soldable cementar roscado juego kit set estuche`.replace(/\s+/g, ' ')));
 // Materiales: solo cuentan si AMBAS descripciones dicen el material y son distintos (una descripción más detallada no es una diferencia).
 const QUAL_MATERIAL = new Set(tokenize(`bronce cobre laton aluminio acero hierro pvc cpvc pead ppr polietileno plastico`.replace(/\s+/g, ' ')));
 // Detalles secundarios (mango, color, acabado, forma): pesan poco.
@@ -1059,9 +1061,9 @@ function ivaPairs(rows, cols) {
     const r = [];
     for (const row of rows.slice(0, 200)) { const a = parseNum(row[i]), b = parseNum(row[j]); if (a > 0 && b > 0) r.push(b / a); }
     if (r.length < 3) continue;
-    r.sort((x, y) => x - y);
-    const med = r[r.length >> 1];
-    if (Math.abs(med - f) < 0.012) res.push({sin: i, con: j});
+    // Solo si casi todas las filas cumplen exactamente con × (1 + IVA): un precio al detal suele ser parecido pero no exacto.
+    const ok = r.filter(x => Math.abs(x - f) < 0.006).length;
+    if (ok / r.length >= 0.85) res.push({sin: i, con: j});
   }
   return res;
 }
@@ -1137,7 +1139,7 @@ Reglas:
 - IVA: indica en "incluye_iva" si cada columna de precio incluye IVA (true), no lo incluye (false) o no se sabe (null). Encabezados como "Precio + IVA", "Precio con IVA", "c/IVA", "IVA incluido", "P.V.P." o "Total" = incluye IVA. "Sin IVA", "s/IVA", "Base", "Neto" = no incluye. Lee también las notas de la lista (ej. "precios incluyen IVA"). Si hay dos columnas y una es la otra × 1,16, la mayor incluye IVA.
 - precio corresponde a la 1ra columna de "columnas_precio" y precio_alterno a la 2da, en ese mismo orden.
 - "descripcion" completa con medidas y especificaciones (ej. 'Tubo PVC 1/2" x 6 m presión').
-- Si la descripción o unidad indica caja/paquete con N unidades, pon N en unidades_por_empaque; si no, 1.
+- unidades_por_empaque: cuántas unidades cubre EL PRECIO de esa fila. Si el precio es por caja/paquete/docena/ciento de N unidades (ej. "Tornillo 6x1 caja x100" con precio por caja), pon N. Si el precio es por unidad, pon 1 aunque la lista indique cantidad por bulto, "inner", empaque master o mínimo de venta (ej. "Cant. BTO: 12", "Min. Vta: 6" con precio unitario → 1). Un juego/kit/set de varias piezas que se vende como uno solo → 1.
 - Si un encabezado de sección (categoría o marca) aplica a varias filas, inclúyelo en la descripción o la marca.
 - Si un producto tiene un título, una lista de características y una tabla de tamaños/modelos con su propio número de parte y precio, crea UNA fila por cada fila de la tabla. Su descripción = título + la característica que define la versión (ej. antichispas, inoxidable, a prueba de explosión) + material principal y mango si se indican + el tamaño de esa fila. Ej: "Mandarria antichispas 20 lb, aluminio-bronce, mango fibra de vidrio". El código es el número de parte de esa fila. No incluyas frases de publicidad ni el tipo de empaque.
 - Ignora filas con precio 0, vacío o "consultar".
@@ -1348,9 +1350,11 @@ function mappingDialog(fname, sheets) {
     const drawPv = () => {
       const items = buildItems();
       el.querySelector('[data-count]').textContent = `· ${items.length} productos válidos`;
-      el.querySelector('[data-pv]').innerHTML = `<tr><th>Código</th><th>Descripción</th><th>Marca</th><th>Unidad</th><th class="r">x Emp.</th><th class="r">Precio</th></tr>` +
-        items.slice(0, 12).map(it => `<tr><td class="mono">${esc(it.code)}</td><td title="${esc(it.desc)}">${esc(it.desc)}</td><td>${esc(it.brand)}</td><td>${esc(it.unit)}</td><td class="r">${it.pack0}</td><td class="r mono">${nf2.format(it.price)}</td></tr>`).join('') +
-        (items.length ? '' : `<tr><td colspan="6" class="muted">Ninguna fila tiene descripción y precio válidos con este mapeo. Ajusta las columnas o la fila de encabezados.</td></tr>`);
+      const packed = items.filter(it => it.pack0 > 1).length;
+      el.querySelector('[data-count]').textContent = `· ${items.length} productos válidos${packed ? ` · ${packed} vienen por empaque y se dividen para comparar por unidad` : ''}`;
+      el.querySelector('[data-pv]').innerHTML = `<tr><th>Código</th><th>Descripción</th><th>Marca</th><th>Unidad</th><th class="r">Precio lista</th><th class="r">Unid. x empaque</th><th class="r">Precio por unidad</th></tr>` +
+        [...items.filter(it => it.pack0 > 1).slice(0, 4), ...items.filter(it => !(it.pack0 > 1))].slice(0, 12).map(it => `<tr><td class="mono">${esc(it.code)}</td><td title="${esc(it.desc)}">${esc(it.desc)}</td><td>${esc(it.brand)}</td><td>${esc(it.unit)}</td><td class="r mono">${nf2.format(it.price)}</td><td class="r ${it.pack0 > 1 ? 'hl' : ''}">${it.pack0}</td><td class="r mono ${it.pack0 > 1 ? 'hl' : ''}">${nf4.format(it.price / (it.pack0 || 1))}</td></tr>`).join('') +
+        (items.length ? '' : `<tr><td colspan="7" class="muted">Ninguna fila tiene descripción y precio válidos con este mapeo. Ajusta las columnas o la fila de encabezados.</td></tr>`);
     };
     const supSel = el.querySelector('[data-sup]');
     el.querySelector('[data-iva]').onchange = () => { ivaTouched = true; };
@@ -1630,7 +1634,7 @@ function renderComp() {
     <input type="text" inputmode="decimal" id="bulkQty" class="num" style="width:70px" placeholder="1">
     <button class="btn sm" data-act="bulkqty">Aplicar</button>
     <button class="btn sm ghost" data-act="clearqty">Vaciar cantidades</button>
-    <span class="spacer"></span><span>Costo real por unidad: con descuentos, IVA, el mejor método de pago y tu tasa. Toca una fila para ver el detalle.</span>
+    <span class="spacer"></span><span>Todo se compara por <b>1 unidad</b>: si viene por caja o paquete se divide entre sus unidades. Incluye descuentos, IVA, el mejor pago y tu tasa.</span>
   </div>
   <div class="tw"><table>
     <tr><th>Producto</th>${cols.map(s => `<th class="r"><span class="row" style="gap:6px;justify-content:flex-end"><span class="dot" style="background:${supColor(s.id)}"></span>${esc(s.name)}</span></th>`).join('')}<th class="r">Diferencia</th><th>Cruce</th><th class="r">Cantidad</th></tr>
@@ -1641,7 +1645,7 @@ function renderComp() {
         <td style="max-width:360px">${esc(g.anchor.desc)}${g.anchor.brand ? ` <span class="tiny">· ${esc(g.anchor.brand)}</span>` : ''}</td>
         ${cols.map(s => { const it = g.bySid[s.id]; const c = costs[s.id];
           if (!it) return `<td class="r na">—</td>`;
-          return `<td class="r mono ${s.id === bestSid && Object.keys(costs).length > 1 ? 'best' : ''}" title="${esc(it.desc)}\nLista: ${fmtCur(it.price, s.listCurrency)}${itemPack(it) > 1 ? ' por ' + itemPack(it) + ' und' : ''}\nMejor pago: ${esc(c?.method?.name || '')}">${c ? fmtShowU(c.cost) : '—'}${itemPack(it) > 1 ? `<div class="tiny">emp. ${itemPack(it)}</div>` : ''}</td>`;
+          return `<td class="r mono ${s.id === bestSid && Object.keys(costs).length > 1 ? 'best' : ''}" title="${esc(it.desc)}\nLista: ${fmtCur(it.price, s.listCurrency)}${itemPack(it) > 1 ? ' por ' + itemPack(it) + ' und' : ''}\nMejor pago: ${esc(c?.method?.name || '')}">${c ? fmtShowU(c.cost) : '—'}${itemPack(it) > 1 ? `<div class="tiny">${fmtCur(it.price, s.listCurrency)} ÷ ${itemPack(it)} und</div>` : ''}</td>`;
         }).join('')}
         <td class="r mono">${gap != null ? nf2.format(gap * 100) + '%' : ''}</td>
         <td>${tag}${g.priceAlert ? ` <span class="tag bad" title="El precio por unidad de uno es ${nf2.format(g.pr)} veces el del otro. Revisa si de verdad es el mismo producto, si el empaque (caja vs unidad) está bien o si se tomó la columna de precio correcta.">⚠ precio ×${nf2.format(g.pr)}</span>` : ''}</td>
@@ -1657,12 +1661,13 @@ function renderGroupDetail(g, supMap) {
   const ncol = M.sups.length + 4;
   return `<tr class="det"><td colspan="${ncol}">
     <table style="background:var(--panel);border:1px solid var(--line);border-radius:8px">
-      <tr><th>Proveedor</th><th>Código</th><th>Descripción en su catálogo</th><th>Marca</th><th>Unidad</th><th class="r">Precio lista</th><th class="r">Unid. x empaque</th><th class="r">Costo real / und</th><th>Mejor pago</th><th></th></tr>
+      <tr><th>Proveedor</th><th>Código</th><th>Descripción en su catálogo</th><th>Marca</th><th>Unidad</th><th class="r">Precio lista</th><th class="r">Unid. x empaque</th><th class="r">Precio lista / und</th><th class="r">Costo real / und</th><th>Mejor pago</th><th></th></tr>
       ${g.members.map((m, i) => { const sup = supMap[m.sid]; const c = sup ? unitCost(m.it, sup) : null;
         return `<tr><td><span class="row" style="gap:6px"><span class="dot" style="background:${supColor(m.sid)}"></span>${esc(supName(m.sid))}</span></td>
         <td class="mono">${esc(m.it.code)}</td><td>${esc(m.it.desc)}</td><td>${esc(m.it.brand)}</td><td>${esc(m.it.unit)}</td>
         <td class="r mono">${fmtCur(m.it.price, sup?.listCurrency)}</td>
         <td class="r"><input type="text" inputmode="decimal" class="num tbl" style="width:64px" data-pack="${esc(m.it.k)}" value="${itemPack(m.it)}"></td>
+        <td class="r mono">${fmtCur(m.it.price / itemPack(m.it), sup?.listCurrency)}</td>
         <td class="r mono">${c ? fmtShowU(c.cost) : '—'}</td><td class="small">${esc(c?.method?.name || '')}</td>
         <td>${g.members.length > 1 ? `<button class="btn sm ghost danger" data-act="split" data-g="${g.id}" data-k="${esc(m.it.k)}" title="No es el mismo producto">Separar</button>` : ''}</td></tr>`;
       }).join('')}
@@ -1670,7 +1675,7 @@ function renderGroupDetail(g, supMap) {
     <div class="row" style="margin-top:8px">
       ${g.status === 'dud' || g.status === 'hi' ? `<button class="btn sm" data-act="confirm" data-g="${g.id}">✓ Sí, son el mismo producto</button>` : ''}
       <button class="btn sm" data-act="link" data-g="${g.id}">+ Vincular otro producto manualmente</button>
-      <span class="tiny">Si un proveedor vende por caja y otro por unidad, ajusta «Unid. x empaque» para comparar por unidad.</span>
+      <span class="tiny">«Unid. x empaque» = cuántas unidades cubre el precio de lista. Si la app lo detectó mal (ej. caja ×100 marcada como 1), corrígelo aquí y se recalcula el precio por unidad.</span>
     </div>
     ${g.priceAlert ? `<div class="note bad small" style="margin-top:8px">⚠ El precio por unidad de uno es <b>${nf2.format(g.pr)} veces</b> el del otro. Un mismo producto no suele costar tan distinto: revisa si es una versión diferente (ej. antichispas, industrial), si el empaque está bien (caja vs unidad) o si se tomó la columna de precio equivocada (con/sin IVA). Si no son el mismo, pulsa <b>Separar</b>.</div>` : ''}
     <div>
@@ -1755,8 +1760,8 @@ function renderOrder(o) {
       </div>
       <details style="margin-top:12px" ${o.lines.length <= 12 ? 'open' : ''}><summary>Productos (${o.lines.length})</summary>
         <div class="tw" style="margin-top:8px"><table>
-          <tr><th>Código</th><th>Descripción</th><th class="r">Cantidad</th><th class="r">Empaques</th><th class="r">Precio lista</th><th class="r">Subtotal lista</th><th class="r">Ahorro vs. siguiente</th></tr>
-          ${lines.map(l => { const alt = altSaving(l, s.id); return `<tr><td class="mono">${esc(l.it.code)}</td><td>${esc(l.it.desc)}</td><td class="r mono">${nf2.format(l.qty)}</td><td class="r mono">${l.pack > 1 ? l.packs + ' × ' + l.pack : l.packs}</td><td class="r mono">${fmtCur(l.it.price, cur)}</td><td class="r mono">${fmtCur(l.sub, cur)}</td><td class="r small">${alt}</td></tr>`; }).join('')}
+          <tr><th>Código</th><th>Descripción</th><th class="r">Unidades</th><th class="r">Empaques a pedir</th><th class="r">Precio lista</th><th class="r">Precio / und</th><th class="r">Subtotal lista</th><th class="r">Ahorro vs. siguiente</th></tr>
+          ${lines.map(l => { const alt = altSaving(l, s.id); return `<tr><td class="mono">${esc(l.it.code)}</td><td>${esc(l.it.desc)}</td><td class="r mono">${nf2.format(l.qty)}</td><td class="r mono">${l.pack > 1 ? l.packs + ' × ' + l.pack : l.packs}</td><td class="r mono">${fmtCur(l.it.price, cur)}${l.pack > 1 ? `<div class="tiny">por ${l.pack} und</div>` : ''}</td><td class="r mono">${fmtCur(l.it.price / l.pack, cur)}</td><td class="r mono">${fmtCur(l.sub, cur)}</td><td class="r small">${alt}</td></tr>`; }).join('')}
         </table></div>
       </details>
       <div class="row" style="margin-top:10px"><button class="btn sm" data-act="copyorder" data-sid="${s.id}">Copiar pedido para WhatsApp / correo</button></div>
@@ -2064,8 +2069,8 @@ async function exportExcel() {
   const res = [['Proveedor', 'Método de pago', 'Moneda', 'Total a pagar', 'Equivalente USD', 'Valor hoy (USD)', 'Subtotal lista', 'Desc. comercial', 'Desc. volumen %', 'Flete', 'Cumple mínimo']];
   for (const o of Object.values(P.orders)) res.push([o.sup.name, o.best?.m.name || '', o.best?.m.currency || '', o.best ? +o.best.pay.toFixed(2) : '', o.best ? +o.best.usd.toFixed(2) : '', o.best ? +o.best.pv.toFixed(2) : '', +o.goods.toFixed(2), o.sup.discounts || '', +(o.tierPct * 100).toFixed(2), o.ship, o.minOK ? 'Sí' : 'No']);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(res), 'Resumen');
-  const det = [['Proveedor', 'Código', 'Descripción', 'Cantidad', 'Empaques', 'Unid. x empaque', 'Precio lista', 'Moneda lista', 'Subtotal lista']];
-  for (const o of Object.values(P.orders)) for (const l of o.lines) det.push([o.sup.name, l.it.code, l.it.desc, l.qty, l.packs, l.pack, l.it.price, o.sup.listCurrency, +l.sub.toFixed(2)]);
+  const det = [['Proveedor', 'Código', 'Descripción', 'Unidades', 'Empaques a pedir', 'Unid. x empaque', 'Precio lista', 'Precio lista por unidad', 'Moneda lista', 'Subtotal lista']];
+  for (const o of Object.values(P.orders)) for (const l of o.lines) det.push([o.sup.name, l.it.code, l.it.desc, l.qty, l.packs, l.pack, l.it.price, +(l.it.price / l.pack).toFixed(4), o.sup.listCurrency, +l.sub.toFixed(2)]);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(det), 'Pedido por proveedor');
   ensureMatches();
   const supMap = Object.fromEntries(S.suppliers.map(s => [s.id, s]));
