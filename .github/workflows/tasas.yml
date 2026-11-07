@@ -1,0 +1,28 @@
+name: Actualizar tasas del día
+on:
+  schedule:
+    # Horas en UTC (Caracas = UTC-4): 7:10 a. m., 1:10 p. m. y 6:10 p. m.
+    - cron: '10 11 * * *'
+    - cron: '10 17 * * *'
+    - cron: '10 22 * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency: tasas
+jobs:
+  tasas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node scripts/update-rates.mjs
+      - name: Guardar cambios
+        run: |
+          if git diff --quiet -- rates.json rates-history.json; then echo "Sin cambios"; exit 0; fi
+          git config user.name "tasas-bot"
+          git config user.email "tasas-bot@users.noreply.github.com"
+          git add rates.json rates-history.json
+          git commit -m "Tasas del $(TZ=America/Caracas date +%F)"
+          git push
