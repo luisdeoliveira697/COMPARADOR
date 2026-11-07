@@ -831,7 +831,7 @@ async function askJSON(prompt, opts = {}, attempt = 0) {
     r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true'},
-      body: JSON.stringify({model: LS.get('model') || MODELS[0][0], max_tokens: 16000, messages: [{role: 'user', content}]})
+      body: JSON.stringify({model: LS.get('model') || MODELS[0][0], max_tokens: 16000, output_config: {effort: opts.effort || 'medium'}, messages: [{role: 'user', content}]})
     });
     j = await r.json().catch(() => null);
   } catch (e) { throw {code: 'network', message: 'Sin conexión con la API de Claude.'}; }
@@ -1024,57 +1024,86 @@ function aiRowsToSheet(rows, priceNames) {
   const head = AI_HEAD.slice();
   if (priceNames?.[0]) head[5] = 'Precio (' + priceNames[0] + ')';
   if (priceNames?.[1]) head[6] = 'Precio (' + priceNames[1] + ')';
-  return {name: 'Extraído', rows: [head, ...rows.map(r => [r.codigo || '', r.descripcion || '', r.marca || '', r.unidad || '', r.unidades_por_empaque || '', r.precio ?? '', r.precio_alterno ?? ''])]};
+  const norm = r => Array.isArray(r) ? [r[0] ?? '', r[1] ?? '', r[2] ?? '', r[3] ?? '', r[4] ?? '', r[5] ?? '', r[6] ?? ''] : [r.codigo || '', r.descripcion || '', r.marca || '', r.unidad || '', r.unidades_por_empaque || '', r.precio ?? '', r.precio_alterno ?? ''];
+  return {name: 'Extraído', rows: [head, ...rows.map(norm)]};
 }
 const EXTRACT_PROMPT = (what) => `Eres un asistente que extrae listas de precios de proveedores de una ferretería.
 Del siguiente ${what} extrae TODOS los productos que tengan precio. No inventes productos ni precios.
 Responde SOLO con JSON con esta forma:
-{"columnas_precio":["nombre de la 1ra columna de precio","nombre de la 2da si existe"],"filas":[{"codigo":"","descripcion":"","marca":"","unidad":"","unidades_por_empaque":1,"precio":0,"precio_alterno":null}]}
+{"columnas_precio":["nombre de la 1ra columna de precio","nombre de la 2da si existe"],"filas":[["codigo","descripcion","marca","unidad",unidades_por_empaque,precio,precio_alterno]]}
+Cada fila es un arreglo en ese orden exacto (usa "" si un texto no existe). Ejemplo: ["T-12","Tubo PVC 1/2\" x 6 m presión","Pavco","UND",1,3.5,null]
 Reglas:
-- "precio" y "precio_alterno" son números con punto decimal (ej. "1.234,56" -> 1234.56). Si solo hay una columna de precio, precio_alterno = null.
+- precio y precio_alterno son números con punto decimal (ej. "1.234,56" -> 1234.56). Si solo hay una columna de precio, precio_alterno = null.
+- No agregues explicaciones ni espacios innecesarios en el JSON.
 - "descripcion" completa con medidas y especificaciones (ej. 'Tubo PVC 1/2" x 6 m presión').
 - Si la descripción o unidad indica caja/paquete con N unidades, pon N en unidades_por_empaque; si no, 1.
 - Si un encabezado de sección (categoría o marca) aplica a varias filas, inclúyelo en la descripción o la marca.
 - Ignora encabezados, totales, condiciones y textos sin precio.`;
+const AI_PARALLEL = 4;
+async function pool(items, n, fn) {
+  let next = 0;
+  const out = new Array(items.length);
+  const worker = async () => { while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); } };
+  await Promise.all(Array.from({length: Math.min(n, items.length)}, worker));
+  return out;
+}
+const FATAL = e => ['no_key', 'bad_key', 'cancelled'].includes(e?.code);
 async function aiExtractPDF(f, pagesLines, pdf) {
   const totalChars = pagesLines.reduce((a, p) => a + p.join('\n').length, 0);
   const scanned = totalChars < 40 * pagesLines.length;
+  if (scanned && !SAMPLE_IMG) { toast('Este PDF parece escaneado: agrega tu clave de Claude en Ajustes para poder leerlo.'); return null; }
   const prog = progressBox('Claude está leyendo el catálogo');
-  const rows = []; let priceNames = null;
+  let priceNames = null, done = 0;
+  const failed = [];
+  const t0 = Date.now();
+  const tick = (total, unit) => {
+    done++;
+    const el = (Date.now() - t0) / 1000, left = done ? el / done * (total - done) : 0;
+    prog.set(done / total, `${done} de ${total} ${unit} listos${done < total && done >= 2 ? ` · faltan ~${left > 90 ? Math.round(left / 60) + ' min' : Math.max(5, Math.round(left)) + ' s'}` : ''}…`);
+  };
   try {
+    let parts;
     if (!scanned) {
       const chunks = []; let cur = '', start = 1;
       pagesLines.forEach((lines, i) => {
         const t = lines.join('\n');
-        if (cur && (cur.length + t.length) > 7000) { chunks.push({t: cur, from: start, to: i}); cur = ''; start = i + 1; }
+        if (cur && (cur.length + t.length) > 4500) { chunks.push({t: cur, from: start, to: i}); cur = ''; start = i + 1; }
         cur += (cur ? '\n' : '') + `--- página ${i + 1} ---\n` + t;
       });
       if (cur) chunks.push({t: cur, from: start, to: pagesLines.length});
-      for (let i = 0; i < chunks.length; i++) {
-        if (prog.cancelled) return null;
-        prog.set(i / chunks.length, `Páginas ${chunks[i].from}–${chunks[i].to} de ${pagesLines.length}…`);
-        const r = await askJSON(EXTRACT_PROMPT('texto (extraído de un PDF; las columnas están separadas por |)') + '\n\nTEXTO:\n' + chunks[i].t, {modelTier: 'default'});
-        if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
-        rows.push(...(r.filas || []));
-      }
+      prog.set(0, `Leyendo ${pagesLines.length} páginas en ${chunks.length} partes, ${AI_PARALLEL} a la vez…`);
+      parts = await pool(chunks, AI_PARALLEL, async c => {
+        if (prog.cancelled) throw {code: 'cancelled'};
+        try {
+          const r = await askJSON(EXTRACT_PROMPT('texto (extraído de un PDF; las columnas están separadas por |)') + '\n\nTEXTO:\n' + c.t, {effort: 'low'});
+          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
+          return r.filas || [];
+        } catch (e) { if (FATAL(e)) throw e; failed.push(c.from === c.to ? `${c.from}` : `${c.from}–${c.to}`); return []; }
+        finally { if (!prog.cancelled) tick(chunks.length, 'partes'); }
+      });
     } else {
-      if (!SAMPLE_IMG) { prog.close(); toast('Este PDF parece escaneado: agrega tu clave de Claude en Ajustes para poder leerlo.'); return null; }
-      for (let p = 1; p <= pdf.numPages; p++) {
-        if (prog.cancelled) return null;
-        prog.set((p - 1) / pdf.numPages, `Leyendo página ${p} de ${pdf.numPages} (escaneada)…`);
-        const page = await pdf.getPage(p);
-        const vp = page.getViewport({scale: 1.6});
-        const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
-        await page.render({canvasContext: cv.getContext('2d'), viewport: vp}).promise;
-        const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
-        const r = await askJSON(EXTRACT_PROMPT('imagen de una página de catálogo'), {images: [blob], modelTier: 'default'});
-        if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
-        rows.push(...(r.filas || []));
-      }
+      const pages = Array.from({length: pdf.numPages}, (_, i) => i + 1);
+      prog.set(0, `Leyendo ${pdf.numPages} páginas escaneadas, ${AI_PARALLEL} a la vez…`);
+      parts = await pool(pages, AI_PARALLEL, async p => {
+        if (prog.cancelled) throw {code: 'cancelled'};
+        try {
+          const page = await pdf.getPage(p);
+          const vp = page.getViewport({scale: 1.6});
+          const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+          await page.render({canvasContext: cv.getContext('2d'), viewport: vp}).promise;
+          const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
+          const r = await askJSON(EXTRACT_PROMPT('imagen de una página de catálogo'), {images: [blob], effort: 'low'});
+          if (!priceNames && r.columnas_precio?.length) priceNames = r.columnas_precio;
+          return r.filas || [];
+        } catch (e) { if (FATAL(e)) throw e; failed.push(String(p)); return []; }
+        finally { if (!prog.cancelled) tick(pages.length, 'páginas'); }
+      });
     }
     prog.close();
+    const rows = parts.flat();
+    if (failed.length) toast(`No se pudieron leer las páginas ${failed.sort((a, b) => parseInt(a) - parseInt(b)).join(', ')}. Revisa la vista previa o vuelve a intentarlo.`, 8000);
     return [aiRowsToSheet(rows, priceNames)];
-  } catch (e) { prog.close(); toast(aiErr(e), 5000); return null; }
+  } catch (e) { prog.close(); if (e?.code !== 'cancelled') toast(aiErr(e), 5000); return null; }
 }
 function basicPDFSheet(pagesLines) {
   const rows = [['Código','Descripción','Precio']];
@@ -1117,7 +1146,7 @@ async function importFile(f) {
       const prog = progressBox('Claude está leyendo la foto');
       prog.set(.3, 'Analizando la imagen…');
       try {
-        const r = await askJSON(EXTRACT_PROMPT('imagen (foto o captura de una lista de precios)'), {images: [f], modelTier: 'default'});
+        const r = await askJSON(EXTRACT_PROMPT('imagen (foto o captura de una lista de precios)'), {images: [f], effort: 'low'});
         prog.close(); sheets = [aiRowsToSheet(r.filas || [], r.columnas_precio)];
       } catch (e) { prog.close(); toast(aiErr(e), 5000); return; }
     } else { toast('Formato no soportado: ' + f.name); return; }
@@ -1763,10 +1792,10 @@ async function aiReview() {
   const prog = progressBox(`Claude está revisando ${pairs.length} coincidencias dudosas`);
   let yes = 0, no = 0;
   try {
-    for (let i = 0; i < pairs.length; i += 30) {
-      if (prog.cancelled) break;
-      prog.set(i / pairs.length, `Revisando ${i + 1}–${Math.min(i + 30, pairs.length)} de ${pairs.length}…`);
-      const batch = pairs.slice(i, i + 30);
+    const batches = []; for (let i = 0; i < pairs.length; i += 30) batches.push(pairs.slice(i, i + 30));
+    let doneB = 0;
+    await pool(batches, AI_PARALLEL, async batch => {
+      if (prog.cancelled) return;
       const prompt = `Eres experto en productos de ferretería. Compara cada par de productos de dos proveedores distintos y decide si son el mismo producto.
 ${EQUIV_RULE()}
 Diferencias de medida, diámetro, calibre, longitud, voltaje, potencia, capacidad, rosca, material o tipo significan que NO son iguales.
@@ -1774,7 +1803,9 @@ Si solo cambia la presentación (uno por unidad y otro en caja/paquete de N), s�
 Responde SOLO JSON: {"r":[{"id":1,"igual":true,"emp_a":1,"emp_b":1}]}
 Pares:
 ${batch.map((p, j) => `${j + 1}. A: ${fmtItemAI(p.a)} | B: ${fmtItemAI(p.b)}`).join('\n')}`;
-      const r = await askJSON(prompt, {modelTier: 'default'});
+      let r; try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
+      finally { doneB++; if (!prog.cancelled) prog.set(doneB / batches.length, `Revisados ${Math.min(doneB * 30, pairs.length)} de ${pairs.length}…`); }
+      if (prog.cancelled) return;
       for (const x of r.r || []) {
         const p = batch[x.id - 1]; if (!p) continue;
         const pk = pairKey(p.a.k, p.b.k);
@@ -1784,7 +1815,7 @@ ${batch.map((p, j) => `${j + 1}. A: ${fmtItemAI(p.a)} | B: ${fmtItemAI(p.b)}`).j
           if (x.emp_b > 1 && !S.pack[p.b.k] && (p.b.pack0 || 1) === 1) S.pack[p.b.k] = Math.round(x.emp_b);
         } else { S.decisions.no[pk] = 1; delete S.decisions.ok[pk]; no++; }
       }
-    }
+    });
     prog.close();
   } catch (e) { prog.close(); toast(aiErr(e), 5000); }
   matchDirty = true; saveConfig(); render();
@@ -1813,23 +1844,25 @@ async function aiFind() {
   const prog = progressBox('Claude está buscando parejas');
   let found = 0;
   try {
-    for (let i = 0; i < tasks.length; i += 15) {
-      if (prog.cancelled) break;
-      prog.set(i / tasks.length, `Revisando ${i + 1}–${Math.min(i + 15, tasks.length)} de ${tasks.length}…`);
-      const batch = tasks.slice(i, i + 15);
+    const batches = []; for (let i = 0; i < tasks.length; i += 15) batches.push(tasks.slice(i, i + 15));
+    let doneB = 0;
+    await pool(batches, AI_PARALLEL, async batch => {
+      if (prog.cancelled) return;
       const prompt = `Eres experto en productos de ferretería. Para cada producto, indica cuál de sus candidatos (de otro proveedor) es el mismo producto, o null si ninguno lo es.
 ${EQUIV_RULE()}
 Diferencias de medida, calibre, longitud, voltaje, capacidad, rosca, material o tipo significan que NO es el mismo. Si solo cambia la presentación (unidad vs caja de N), sí es el mismo.
 Responde SOLO JSON: {"r":[{"id":1,"elegido":2}]}  (elegido = número del candidato o null)
 ${batch.map((t, j) => `${j + 1}. Producto: ${fmtItemAI(t.it)}\n${t.cands.map((c, k) => `   ${k + 1}) ${fmtItemAI(c.it)}`).join('\n')}`).join('\n')}`;
-      const r = await askJSON(prompt, {modelTier: 'default'});
+      let r; try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
+      finally { doneB++; if (!prog.cancelled) prog.set(doneB / batches.length, `Revisados ${Math.min(doneB * 15, tasks.length)} de ${tasks.length}…`); }
+      if (prog.cancelled) return;
       for (const x of r.r || []) {
         const t = batch[x.id - 1]; if (!t) continue;
         const c = x.elegido ? t.cands[x.elegido - 1] : null;
         if (c) { S.decisions.ok[pairKey(t.it.k, c.it.k)] = 1; found++; }
         else for (const cc of t.cands) S.decisions.no[pairKey(t.it.k, cc.it.k)] = 1;
       }
-    }
+    });
     prog.close();
   } catch (e) { prog.close(); toast(aiErr(e), 5000); }
   matchDirty = true; saveConfig(); render();
