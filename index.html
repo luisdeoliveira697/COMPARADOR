@@ -220,8 +220,9 @@ const PRESETS = [
   {name: 'Tarjeta de crédito', currency: 'Bs'}, {name: 'Crédito 15 días', currency: 'USD', days: 15},
   {name: 'Crédito 30 días', currency: 'USD', days: 30}, {name: 'Otro', currency: 'USD'}
 ];
+function newTerm(t = {}) { return {days: t.days ?? '', disc: t.disc ?? '', discMin: t.discMin ?? ''}; }
 function newMethod(p = {}) {
-  return {id: uid(), name: p.name || 'Pago de contado', enabled: true, currency: p.currency || 'USD', rateSrc: 'bcv', rate: '', disc: '', discMin: '', surch: '', fee: '', days: p.days || '', max: ''};
+  return {id: uid(), name: p.name || 'Pago de contado', enabled: true, currency: p.currency || 'USD', rateSrc: 'bcv', rate: '', surch: '', fee: '', max: '', terms: [newTerm({days: p.days || ''})]};
 }
 function newSupplier(name, cur = 'USD') {
   return {id: uid(), name, listCurrency: cur, ivaIncluded: true, discounts: '', tiers: [], minOrder: '', shipping: '', freeShipFrom: '', notes: '', methods: [newMethod({currency: cur})]};
@@ -302,8 +303,9 @@ function pairScore(a, b) {
 }
 const AUTO_THR = 0.72, MIN_THR = 0.5;
 
+function activeSups() { return S.suppliers.filter(s => s.active !== false && S.catalogs[s.id]?.items?.length); }
 function computeMatches() {
-  const sups = S.suppliers.filter(s => S.catalogs[s.id]?.items?.length);
+  const sups = activeSups();
   const all = [];
   for (const s of sups) for (const it of S.catalogs[s.id].items) all.push(it);
   const df = new Map();
@@ -431,12 +433,22 @@ function pvF(days) { const cm = G().costMoney / 100; return days > 0 && cm > 0 ?
 function methodFactor(sup, m, discOK) {
   return convF(sup, m) * (discOK ? (1 - num(m.disc) / 100) : 1) * (1 + num(m.surch) / 100) * toUSDF(m.currency) * pvF(num(m.days));
 }
+function termLabel(t) { const d = num(t.days); return d > 0 ? `a ${d} días` : 'de contado'; }
+function methodOptions(sup) {
+  const out = [];
+  for (const m of sup.methods) {
+    if (!m.enabled) continue;
+    const terms = (m.terms && m.terms.length) ? m.terms : [newTerm()];
+    terms.forEach((t, i) => out.push({...m, disc: t.disc, days: t.days, discMin: t.discMin, baseName: m.name,
+      name: (terms.length > 1 || num(t.days) > 0) ? `${m.name} · ${termLabel(t)}` : m.name, termIdx: i}));
+  }
+  return out;
+}
 function ivaF(sup) { return sup.ivaIncluded ? 1 : (1 + G().iva / 100); }
 function itemPack(it) { return S.pack[it.k] || it.pack0 || 1; }
 function unitCost(it, sup) {
   let best = null;
-  for (const m of sup.methods) {
-    if (!m.enabled) continue;
+  for (const m of methodOptions(sup)) {
     const f = methodFactor(sup, m, true);
     if (!isFinite(f)) continue;
     if (!best || f < best.f) best = {f, m};
@@ -461,8 +473,7 @@ function evalOrder(sup, lines) {
   const ship = (num(sup.freeShipFrom) > 0 && net >= num(sup.freeShipFrom)) ? 0 : num(sup.shipping);
   const minOK = net >= num(sup.minOrder);
   const methods = [];
-  for (const m of sup.methods) {
-    if (!m.enabled) continue;
+  for (const m of methodOptions(sup)) {
     const c = convF(sup, m), u = toUSDF(m.currency);
     if (!isFinite(c) || !isFinite(u)) { methods.push({m, ok: false, why: 'Falta la tasa de cambio'}); continue; }
     const discOK = net >= num(m.discMin);
@@ -490,7 +501,7 @@ function fmtShowU(usd) { if (!isFinite(usd)) return '—'; const [v, s] = showCo
 /* ================= optimizador ================= */
 function buildLines() {
   ensureMatches();
-  const supMap = Object.fromEntries(S.suppliers.map(s => [s.id, s]));
+  const supMap = Object.fromEntries(activeSups().map(s => [s.id, s]));
   const lines = [];
   for (const g of M.groups) {
     const q = groupQty(g); if (!(q > 0)) continue;
@@ -513,7 +524,7 @@ function optimize(lines) {
     const ctx = {};
     for (const sid of sids) {
       const sup = supMap[sid]; let mf = Infinity;
-      for (const m of sup.methods) if (m.enabled) { const f = methodFactor(sup, m, true); if (isFinite(f) && f < mf) mf = f; }
+      for (const m of methodOptions(sup)) { const f = methodFactor(sup, m, true); if (isFinite(f) && f < mf) mf = f; }
       ctx[sid] = {tier: 0, mf: isFinite(mf) ? mf : 1e6};
     }
     return ctx;
@@ -676,7 +687,8 @@ function applyCfg(cfg) {
   S.global = {...DEF_GLOBAL, ...(cfg.global || {})};
   if (cfg.global && !cfg.global.myRateSrc) S.global.myRateSrc = num(cfg.global.myRate) > 0 ? 'manual' : 'binance';
   S.suppliers = (cfg.suppliers || []).map(s => ({...newSupplier(s.name), ...s, tiers: s.tiers || [],
-    methods: (s.methods || []).map(m => ({...newMethod(), ...m, rateSrc: m.rateSrc || (num(m.rate) > 0 ? 'manual' : 'mine')}))}));
+    methods: (s.methods || []).map(m => ({...newMethod(), ...m, rateSrc: m.rateSrc || (num(m.rate) > 0 ? 'manual' : 'mine'),
+      terms: (m.terms && m.terms.length) ? m.terms.map(newTerm) : [newTerm({days: m.days, disc: m.disc, discMin: m.discMin})]}))}));
 }
 async function loadAll() {
   const [cfgD, decD, qD] = await Promise.all([Store.get('config'), Store.get('decisions'), Store.get('qty')]);
@@ -1308,8 +1320,9 @@ function renderCat() {
   </div>
   <div style="height:16px"></div>
   ${rows.length ? `<div class="tw"><table>
-    <tr><th>Proveedor</th><th class="r">Productos</th><th>Archivos</th><th>Actualizado</th><th></th></tr>
-    ${rows.map(({s, c}) => `<tr>
+    <tr><th style="width:70px">Comparar</th><th>Proveedor</th><th class="r">Productos</th><th>Archivos</th><th>Actualizado</th><th></th></tr>
+    ${rows.map(({s, c}) => `<tr style="${s.active === false ? 'opacity:.55' : ''}">
+      <td style="text-align:center">${c ? `<input type="checkbox" data-active="${s.id}" ${s.active !== false ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer">` : ''}</td>
       <td><span class="row" style="gap:8px"><span class="dot" style="background:${supColor(s.id)}"></span><b>${esc(s.name)}</b></span></td>
       <td class="r mono">${c ? nf0.format(c.items.length) : '<span class="muted">sin catálogo</span>'}</td>
       <td class="small muted">${c ? esc(c.files.join(', ')) : ''}</td>
@@ -1318,7 +1331,8 @@ function renderCat() {
         ${c ? `<button class="btn sm" data-act="viewcat" data-sid="${s.id}">Ver</button><button class="btn sm ghost danger" data-act="delcat" data-sid="${s.id}">Quitar catálogo</button>` : ''}
       </span></td></tr>`).join('')}
   </table></div>
-  <div class="row" style="margin-top:14px"><span class="muted small">${nf0.format(total)} productos en total.</span><span class="spacer"></span>
+  <div class="row" style="margin-top:14px"><span class="muted small">${nf0.format(total)} productos en total · <b>${activeSups().length}</b> de ${rows.filter(r => r.c).length} catálogos marcados para comparar.</span>
+    <button class="btn sm ghost" data-act="actall">Marcar todos</button><button class="btn sm ghost" data-act="actnone">Desmarcar todos</button><span class="spacer"></span>
     <button class="btn" data-goto="prov">Configurar condiciones y pagos →</button></div>`
   : `<div class="note" style="margin-top:4px"><b>Cómo funciona:</b> 1) sube los catálogos; 2) en <i>Proveedores y pagos</i> anota los descuentos y las condiciones de cada método de pago; 3) en <i>Comparativa</i> revisa los productos que coinciden y pon las cantidades; 4) en <i>Pedido óptimo</i> la app reparte el pedido entre proveedores y elige cómo pagar a cada uno para que el total sea el más bajo.</div>`}`;
 }
@@ -1348,12 +1362,13 @@ function renderProv() {
   <details class="card"><summary>Ejemplos de cómo anotar condiciones comunes</summary>
     <ul class="small" style="margin:10px 0 0;padding-left:18px;line-height:1.7">
       <li><b>Descuento comercial de 10% más 5% adicional:</b> en «Descuentos comerciales» escribe <kbd>10+5</kbd> (se aplican en cascada, uno sobre otro).</li>
-      <li><b>8% por pagar en efectivo USD:</b> en el método «Efectivo USD», descuento <kbd>8</kbd>.</li>
-      <li><b>Descuento solo si el pedido pasa de $500:</b> en ese método, «Desc. desde» <kbd>500</kbd>. Si el pedido no llega, la app lo calcula sin descuento.</li>
+      <li><b>8% por pagar en efectivo USD:</b> en el método «Efectivo USD», plazo <kbd>0</kbd> días → <kbd>8</kbd> % desc.</li>
+      <li><b>Pronto pago:</b> transferencia de contado 6%, a 15 días 3%, a 30 días sin descuento: en ese método agrega tres plazos (<kbd>0</kbd>→<kbd>6</kbd>, <kbd>15</kbd>→<kbd>3</kbd>, <kbd>30</kbd>→<kbd>0</kbd>). La app compara cada plazo usando tu «costo del dinero»: si tu dinero rinde o se devalúa más que el descuento, conviene el crédito.</li>
+      <li><b>Descuento solo si el pedido pasa de $500:</b> en ese plazo, «desde» <kbd>500</kbd>. Si el pedido no llega, la app lo calcula sin descuento.</li>
       <li><b>Pago en Bs a la tasa BCV</b>: método en moneda Bs y en «Tasa prov.» elige <i>BCV</i>; se actualiza sola cada día. Si te cobran a una tasa menor que tu valor del dólar (por ejemplo BCV frente a Binance), pagar en Bs te sale más barato y la app lo detecta. Si el proveedor usa su propia tasa, elige <i>Manual</i> y escríbela.</li>
       <li><b>Proveedor que cotiza en euros</b>: pon la moneda de su lista en EUR; los pagos en Bs se convierten con el euro BCV (o la fuente que elijas).</li>
       <li><b>Comisión, impuesto o recargo del método</b> (punto de venta, tarjeta, impuesto por pago en divisas, etc.): en «Recargo %».</li>
-      <li><b>Crédito a 30 días:</b> «Días» <kbd>30</kbd>. Si tiene tope de crédito, ponlo en «Límite».</li>
+      <li><b>Crédito a 30 días:</b> plazo <kbd>30</kbd> días. Si tiene tope de crédito, ponlo en «Límite».</li>
       <li><b>Escalas por volumen</b> (ej. 3% desde $1.000 y 5% desde $3.000): agrega dos filas en «Descuento por volumen».</li>
       <li><b>Flete:</b> costo fijo por pedido; con «Flete gratis desde» se elimina al superar ese monto.</li>
     </ul>
@@ -1363,7 +1378,7 @@ function renderSup(s) {
   const open = UI.openSup === s.id;
   const cat = S.catalogs[s.id];
   const mEn = s.methods.filter(m => m.enabled);
-  const summary = [s.listCurrency, s.ivaIncluded ? 'con IVA' : '+IVA', s.discounts ? 'desc. ' + s.discounts + '%' : null, (s.tiers || []).length ? s.tiers.length + ' escala(s)' : null, num(s.minOrder) ? 'mín. ' + fmtCur(num(s.minOrder), s.listCurrency) : null, mEn.length + ' método(s) de pago'].filter(Boolean).join(' · ');
+  const summary = [s.listCurrency, s.ivaIncluded ? 'con IVA' : '+IVA', s.discounts ? 'desc. ' + s.discounts + '%' : null, (s.tiers || []).length ? s.tiers.length + ' escala(s)' : null, num(s.minOrder) ? 'mín. ' + fmtCur(num(s.minOrder), s.listCurrency) : null, mEn.length + ' método(s) de pago' + (methodOptions(s).length > mEn.length ? ` (${methodOptions(s).length} opciones con plazos)` : '')].filter(Boolean).join(' · ');
   return `<div class="sup">
     <div class="hd" data-act="togglesup" data-sid="${s.id}">
       <span class="dot" style="background:${supColor(s.id)}"></span><span class="nm">${esc(s.name)}</span>
@@ -1387,27 +1402,36 @@ function renderSup(s) {
         ${s.tiers.map((t, i) => `<tr><td>${inp(`t:${s.id}:${i}:from`, t.from, {cls: 'tbl'})}</td><td>${inp(`t:${s.id}:${i}:pct`, t.pct, {cls: 'tbl'})}</td><td><button class="btn sm ghost danger" data-act="deltier" data-sid="${s.id}" data-i="${i}">✕</button></td></tr>`).join('')}</table>` : ''}
       <button class="btn sm" data-act="addtier" data-sid="${s.id}" style="margin-top:6px">+ Agregar escala</button>
       <h3>Métodos de pago que acepta</h3>
+      <p class="tiny" style="margin:-4px 0 8px">Para cada método anota sus plazos: de contado, a 15 días, a 30 días… cada uno con el descuento que te da el proveedor. La app prueba todos y elige el más conveniente (considerando tu costo del dinero).</p>
       <div class="tw"><table class="mtbl">
-        <tr><th>Usar</th><th>Método</th><th>Moneda</th><th class="r" title="Tasa que usa este proveedor para convertir entre la moneda de su lista y la del pago">Tasa prov.</th><th class="r">Desc. %</th><th class="r" title="Monto mínimo del pedido para que aplique el descuento">Desc. desde</th><th class="r" title="Comisión, impuesto o recargo del método">Recargo %</th><th class="r" title="Cargo fijo por pago (en la moneda del método)">Cargo fijo</th><th class="r" title="Días de crédito">Días</th><th class="r" title="Límite máximo de pago o de crédito">Límite</th><th></th></tr>
+        <tr><th>Usar</th><th>Método</th><th>Moneda</th><th class="r" title="Tasa que usa este proveedor para convertir entre la moneda de su lista y la del pago">Tasa prov.</th><th>Plazos y descuentos</th><th class="r" title="Comisión, impuesto o recargo del método">Recargo %</th><th class="r" title="Cargo fijo por pago (en la moneda del método)">Cargo fijo</th><th class="r" title="Límite máximo de pago o de crédito">Límite</th><th></th></tr>
         ${s.methods.map(m => {
           const cross = m.currency !== s.listCurrency;
-          return `<tr>
+          const terms = m.terms && m.terms.length ? m.terms : [newTerm()];
+          return `<tr style="${m.enabled ? '' : 'opacity:.55'}">
           <td><input type="checkbox" data-bind="m:${s.id}:${m.id}:enabled" data-type="bool" ${m.enabled ? 'checked' : ''}></td>
-          <td style="min-width:150px">${inp(`m:${s.id}:${m.id}:name`, m.name, {type: 'text', cls: 'tbl'})}</td>
+          <td style="min-width:140px">${inp(`m:${s.id}:${m.id}:name`, m.name, {type: 'text', cls: 'tbl'})}</td>
           <td><select class="tbl" data-bind="m:${s.id}:${m.id}:currency" data-type="text">${['USD','EUR','Bs'].map(c => `<option ${m.currency === c ? 'selected' : ''}>${c}</option>`).join('')}</select></td>
           <td class="r" style="white-space:nowrap">${cross ? `<select class="tbl" data-bind="m:${s.id}:${m.id}:rateSrc" data-type="text">${['bcv','binance','mine','manual'].map(k => `<option value="${k}" ${(m.rateSrc || 'mine') === k ? 'selected' : ''}>${{bcv: 'BCV', binance: 'Binance', mine: 'Tu tasa', manual: 'Manual'}[k]}</option>`).join('')}</select>${(m.rateSrc === 'manual') ? ' ' + inp(`m:${s.id}:${m.id}:rate`, m.rate, {cls: 'tbl', ph: 'Bs/' + foreignCur(s, m), w: '80px'}) : `<div class="tiny">${rateFor(m, s) ? nf2.format(rateFor(m, s)) + ' Bs/' + (foreignCur(s, m) === 'EUR' ? '€' : '$') : 'sin tasa'}</div>`}` : '<span class="tiny">—</span>'}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:disc`, m.disc, {cls: 'tbl', ph: '0', w: '64px'})}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:discMin`, m.discMin, {cls: 'tbl', ph: '—', w: '80px'})}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:surch`, m.surch, {cls: 'tbl', ph: '0', w: '64px'})}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:fee`, m.fee, {cls: 'tbl', ph: '0', w: '70px'})}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:days`, m.days, {cls: 'tbl', ph: '0', w: '54px'})}</td>
-          <td class="r">${inp(`m:${s.id}:${m.id}:max`, m.max, {cls: 'tbl', ph: '—', w: '80px'})}</td>
-          <td><button class="btn sm ghost danger" data-act="delmethod" data-sid="${s.id}" data-mid="${m.id}">✕</button></td></tr>`;
+          <td style="min-width:330px">
+            ${terms.map((t, i) => `<div class="row" style="gap:5px;margin-bottom:4px;flex-wrap:nowrap">
+              <span class="tiny" style="width:14px">${i + 1}.</span>
+              ${inp(`p:${s.id}:${m.id}:${i}:days`, t.days, {cls: 'tbl', ph: '0', w: '52px'})}<span class="small">días →</span>
+              ${inp(`p:${s.id}:${m.id}:${i}:disc`, t.disc, {cls: 'tbl', ph: '0', w: '56px'})}<span class="small">% desc.</span>
+              <span class="small muted">desde</span>${inp(`p:${s.id}:${m.id}:${i}:discMin`, t.discMin, {cls: 'tbl', ph: '—', w: '70px'})}
+              ${terms.length > 1 ? `<button class="btn sm ghost danger" data-act="delterm" data-sid="${s.id}" data-mid="${m.id}" data-i="${i}" title="Quitar plazo">✕</button>` : ''}
+            </div>`).join('')}
+            <button class="btn sm ghost" data-act="addterm" data-sid="${s.id}" data-mid="${m.id}" style="padding:2px 6px">+ plazo</button>
+          </td>
+          <td class="r">${inp(`m:${s.id}:${m.id}:surch`, m.surch, {cls: 'tbl', ph: '0', w: '60px'})}</td>
+          <td class="r">${inp(`m:${s.id}:${m.id}:fee`, m.fee, {cls: 'tbl', ph: '0', w: '64px'})}</td>
+          <td class="r">${inp(`m:${s.id}:${m.id}:max`, m.max, {cls: 'tbl', ph: '—', w: '76px'})}</td>
+          <td><button class="btn sm ghost danger" data-act="delmethod" data-sid="${s.id}" data-mid="${m.id}" title="Eliminar método">✕</button></td></tr>`;
         }).join('')}
       </table></div>
       <div class="row" style="margin-top:8px">
         <select data-preset="${s.id}"><option value="">+ Agregar método…</option>${PRESETS.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('')}</select>
-        <span class="tiny">«Tasa prov.»: BCV y Binance se actualizan cada día. «Desc. desde» y «Límite» se miden en ${s.listCurrency} sobre el pedido.</span>
+        <span class="tiny">«Tasa prov.»: BCV y Binance se actualizan cada día. «desde» = monto mínimo del pedido (en ${s.listCurrency}) para que aplique ese descuento. «Límite» = tope de pago o de crédito.</span>
         <span class="spacer"></span><button class="btn sm ghost danger" data-act="delsup" data-sid="${s.id}">Eliminar proveedor</button>
       </div>
     </div>` : ''}
@@ -1423,6 +1447,7 @@ function groupCosts(g, supMap) {
 }
 function renderComp() {
   if (!S.suppliers.some(s => S.catalogs[s.id]?.items.length)) return `<div class="empty card">Primero sube los catálogos en la pestaña <b>1. Catálogos</b>.</div>`;
+  if (activeSups().length < 2) return `<div class="empty card">Marca al menos <b>2 catálogos</b> para comparar en la pestaña <b>1. Catálogos</b>.<br><br><button class="btn pri" data-goto="cat">Ir a Catálogos</button></div>`;
   ensureMatches();
   const supMap = Object.fromEntries(S.suppliers.map(s => [s.id, s]));
   const cols = M.sups;
@@ -1446,6 +1471,7 @@ function renderComp() {
   const needRate = S.suppliers.some(s => s.listCurrency !== 'USD' || s.methods.some(m => m.enabled && m.currency !== 'USD')) && !G().myRate;
   return `
   ${needRate ? `<div class="note warn" style="margin-bottom:12px">Falta tu valor del dólar en <b>Proveedores y pagos</b> (o las tasas del día aún no cargan); sin él no se pueden comparar precios o pagos en Bs.</div>` : ''}
+  <div class="small muted" style="margin-bottom:10px">Comparando ${activeSups().length} catálogos: ${activeSups().map(s => `<span class="row" style="display:inline-flex;gap:4px;margin-right:8px"><span class="dot" style="background:${supColor(s.id)}"></span>${esc(s.name)}</span>`).join('')} <button class="btn sm ghost" data-goto="cat">Cambiar</button></div>
   <div class="stats">
     <div class="stat hl"><div class="v">${nf0.format(counts.match)}</div><div class="l">productos cruzados entre 2 o más proveedores</div></div>
     <div class="stat"><div class="v">${nf0.format(counts.dud)}</div><div class="l">coincidencias dudosas por revisar</div></div>
@@ -1514,7 +1540,7 @@ function renderGroupDetail(g, supMap) {
   </td></tr>`;
 }
 function renderPlan() {
-  if (!S.suppliers.some(s => S.catalogs[s.id]?.items.length)) return `<div class="empty card">Primero sube los catálogos en la pestaña <b>1. Catálogos</b>.</div>`;
+  if (!activeSups().length) return `<div class="empty card">Primero sube los catálogos en la pestaña <b>1. Catálogos</b>.</div>`;
   const lines = buildLines();
   if (!lines.length) return `<div class="empty card"><b>Aún no hay productos en tu pedido.</b><br><br>Ve a <b>3. Comparativa</b> y escribe la cantidad que necesitas de cada producto (o usa «Cantidad para los productos filtrados»).<br><br><button class="btn pri" data-goto="comp">Ir a la comparativa</button></div>`;
   if (UI.planDirty || !UI.plan) { UI.plan = optimize(lines); UI.planDirty = false; }
@@ -1638,6 +1664,10 @@ function bindMain() {
     el.onchange = () => { const g = M.groups[+el.dataset.qty]; setGroupQty(g, Math.max(0, num(el.value))); };
     el.onkeydown = e => { if (e.key === 'Enter') { el.blur(); const all = $$('[data-qty]', main); const i = all.indexOf(el); all[i + 1]?.focus(); } };
   });
+  $$('[data-active]', main).forEach(el => el.onchange = () => {
+    const s = S.suppliers.find(x => x.id === el.dataset.active); s.active = el.checked;
+    matchDirty = true; UI.planDirty = true; UI.openGroup = null; saveConfig(); render();
+  });
   $$('[data-pack]', main).forEach(el => el.onchange = () => {
     const v = Math.max(1, Math.round(num(el.value) || 1)); S.pack[el.dataset.pack] = v; UI.planDirty = true; saveConfig(); render();
   });
@@ -1654,6 +1684,8 @@ function onBind(e) {
     const s = S.suppliers.find(x => x.id === a); s[b] = v; if (b === 'name') rerender = false;
   } else if (kind === 'm') {
     const s = S.suppliers.find(x => x.id === a); const m = s.methods.find(x => x.id === b); m[c] = v;
+  } else if (kind === 'p') {
+    const s = S.suppliers.find(x => x.id === a); const m = s.methods.find(x => x.id === b); m.terms[+c][el.dataset.bind.split(':')[4]] = v;
   } else if (kind === 't') {
     const s = S.suppliers.find(x => x.id === a); s.tiers[+b][c] = v;
   }
@@ -1675,6 +1707,9 @@ document.addEventListener('click', async e => {
     case 'togglesup': UI.openSup = UI.openSup === sid ? null : sid; render(); break;
     case 'addtier': sup.tiers.push({from: '', pct: ''}); onCfgChange(true); break;
     case 'deltier': sup.tiers.splice(+el.dataset.i, 1); onCfgChange(true); break;
+    case 'actall': case 'actnone': S.suppliers.forEach(x => x.active = act === 'actall'); matchDirty = true; UI.planDirty = true; saveConfig(); render(); break;
+    case 'addterm': { const m = sup.methods.find(x => x.id === el.dataset.mid); m.terms = m.terms || []; m.terms.push(newTerm()); onCfgChange(true); break; }
+    case 'delterm': { const m = sup.methods.find(x => x.id === el.dataset.mid); m.terms.splice(+el.dataset.i, 1); onCfgChange(true); break; }
     case 'delmethod': sup.methods = sup.methods.filter(m => m.id !== el.dataset.mid); onCfgChange(true); break;
     case 'opengroup': { const gid = +el.dataset.g; UI.openGroup = UI.openGroup === gid ? null : gid; render(); break; }
     case 'more': UI.compLimit += 200; render(); break;
