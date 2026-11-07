@@ -256,13 +256,29 @@ function normText(s) {
     .replace(/(\d)([a-z])/g, '$1 $2').replace(/([a-z])(\d)/g, '$1 $2');
   return s;
 }
+// Sinónimos de ferretería (Venezuela y Latinoamérica): ambos lados se llevan a la misma palabra antes de comparar.
+const SYN_RAW = {
+  pinza: 'alicate alicates pinzas tenaza tenazas', mandarria: 'marro marros porra porras combo mandarrias',
+  destornillador: 'desarmador desarmadores atornillador destornilladores', esmeril: 'pulidora pulidoras amoladora amoladoras esmeriladora',
+  sierra: 'segueta seguetas', metrica: 'flexometro flexometros wincha huincha metro', ajustable: 'inglesa',
+  tubo: 'tuberia tuberias', bombillo: 'bombilla bombillas foco focos ampolleta', breaker: 'braker interruptor termomagnetico',
+  pegamento: 'pega pegas cola adhesivo', paso: 'arresto', regadera: 'ducha duchas', inodoro: 'poceta pocetas wc sanitario',
+  lavamanos: 'lavabo lavabos lavamano', fregadero: 'lavaplatos lavaplato', phillips: 'estrella cruz', plano: 'paleta pala',
+  taladro: 'taladros', cerradura: 'chapa chapas', bisagra: 'bisagras', tornillo: 'tornillos', manguera: 'mangueras',
+  brocha: 'brochas', martillo: 'martillos', serrucho: 'serruchos', candado: 'candados', carretilla: 'carretillas',
+  teflon: 'teipe-teflon', extension: 'extensor extensiones', tomacorriente: 'toma tomas enchufe enchufes', llana: 'llanas',
+  cuchara: 'palustre palustres', nivel: 'niveles', espatula: 'espatulas', rodillo: 'rodillos', lija: 'lijas', soldadura: 'electrodo electrodos'
+};
+const SYN = new Map();
+function stemWord(t) { if (t.length > 3 && t.endsWith('s')) t = t.slice(0, -1); if (t.length >= 5 && /[aoe]$/.test(t)) t = t.slice(0, -1); return t; }
+for (const [canon, alts] of Object.entries(SYN_RAW)) { const c = stemWord(canon); for (const a of alts.split(' ')) SYN.set(stemWord(a), c); SYN.set(c, c); }
 function tokenize(s) {
   const out = [];
   for (let t of normText(s).split(/[^a-z0-9.\/]+/)) {
     t = t.replace(/^[.\/]+|[.\/]+$/g, '');
     if (!t || STOP.has(t)) continue;
     if (/^\d/.test(t)) { if (/^\d+(\.\d+)?$/.test(t)) t = String(parseFloat(t)); }
-    else { if (t.length > 3 && t.endsWith('s')) t = t.slice(0, -1); if (t.length >= 5 && /[aoe]$/.test(t)) t = t.slice(0, -1); }
+    else { t = stemWord(t); if (SYN.has(t)) t = SYN.get(t); }
     if (t.length === 1 && !/\d/.test(t) && !['m','g','l','v','w','a'].includes(t)) continue;
     out.push(t);
   }
@@ -359,7 +375,8 @@ function computeMatches() {
   for (const it of all) for (const t of it.tokSet) df.set(t, (df.get(t) || 0) + 1);
   const N = all.length || 1;
   IDF = t => Math.log(1 + N / (df.get(t) || 1));
-  const maxDf = Math.max(40, N * 0.05);
+  // Antes se ignoraban las palabras comunes (ej. "pinza") al buscar candidatos, y se perdían familias enteras de cruces.
+  const maxDf = Math.max(400, N * 0.3);
   const groups = [], itemGroup = new Map(), index = new Map();
   const addToIndex = (gi, it) => {
     for (const t of it.tokSet) {
@@ -401,7 +418,7 @@ function computeMatches() {
         const w = IDF(t);
         for (const gi of a) acc.set(gi, (acc.get(gi) || 0) + w);
       }
-      const top = [...acc.entries()].filter(([gi]) => !groups[gi].sids.has(s.id)).sort((a, b) => b[1] - a[1]).slice(0, 25).map(x => x[0]);
+      const top = [...acc.entries()].filter(([gi]) => !groups[gi].sids.has(s.id)).sort((a, b) => b[1] - a[1]).slice(0, 40).map(x => x[0]);
       const forced = [];
       for (const pk of (okMap.get(it.k) || [])) { const gi = itemGroup.get(pk); if (gi != null && !groups[gi].sids.has(s.id)) forced.push(gi); }
       const seen = new Set(), local = [];
@@ -2000,12 +2017,12 @@ async function aiFind() {
     const it = g.anchor; const sid = g.members[0].sid;
     const acc = new Map();
     for (const t of it.tokSet) { const a = M.index.get(t); if (!a) continue; const w = IDF(t); for (const gi of a) if (gi !== g.id) acc.set(gi, (acc.get(gi) || 0) + w); }
-    const cands = [...acc.entries()].filter(([gi]) => !M.groups[gi].sids.has(sid)).sort((a, b) => b[1] - a[1]).slice(0, 12)
+    const cands = [...acc.entries()].filter(([gi]) => !M.groups[gi].sids.has(sid)).sort((a, b) => b[1] - a[1]).slice(0, 30)
       .map(([gi]) => M.groups[gi]).map(og => {
         let best = null, bs = 0;
         for (const m of og.members) { if (S.decisions.no[pairKey(it.k, m.it.k)]) continue; const sc = pairScore(it, m.it); if (sc > bs) { bs = sc; best = m.it; } }
         return best ? {it: best, sc: bs} : null;
-      }).filter(x => x && x.sc >= 0.22).sort((a, b) => b.sc - a.sc).slice(0, 5);
+      }).filter(x => x && x.sc >= 0.18).sort((a, b) => b.sc - a.sc).slice(0, 6);
     if (cands.length) tasks.push({it, cands});
   }
   if (!tasks.length) { toast('No hay candidatos razonables para los productos sin pareja.'); return; }
