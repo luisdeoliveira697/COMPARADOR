@@ -1862,7 +1862,7 @@ document.addEventListener('click', async e => {
     case 'more': UI.compLimit += 200; render(); break;
     case 'split': {
       const g = M.groups[+el.dataset.g], k = el.dataset.k;
-      for (const m of g.members) if (m.it.k !== k) { const pk = pairKey(k, m.it.k); S.decisions.no[pk] = 1; delete S.decisions.ok[pk]; }
+      for (const m of g.members) if (m.it.k !== k) { const pk = pairKey(k, m.it.k); S.decisions.no[pk] = 'u'; delete S.decisions.ok[pk]; }
       matchDirty = true; saveConfig(); render(); toast('Productos separados'); break;
     }
     case 'confirm': {
@@ -1952,7 +1952,7 @@ function linkDialog(g) {
       const k = b.dataset.k;
       for (const mm of g.members) { const pk = pairKey(k, mm.it.k); S.decisions.ok[pk] = 1; delete S.decisions.no[pk]; }
       const oldG = M.groups[M.itemGroup.get(k)];
-      if (oldG) for (const mm of oldG.members) if (mm.it.k !== k) S.decisions.no[pairKey(k, mm.it.k)] = 1;
+      if (oldG) for (const mm of oldG.members) if (mm.it.k !== k) S.decisions.no[pairKey(k, mm.it.k)] = 'u';
       matchDirty = true; saveConfig(); m.close(); render(); toast('Producto vinculado');
     });
   };
@@ -2005,7 +2005,7 @@ ${batch.map((p, j) => { const r = priceRatio(p.a, p.b); return `${j + 1}. A: ${f
           S.decisions.ok[pk] = 1; delete S.decisions.no[pk]; yes++;
           if (x.emp_a > 1 && !S.pack[p.a.k] && (p.a.pack0 || 1) === 1) S.pack[p.a.k] = Math.round(x.emp_a);
           if (x.emp_b > 1 && !S.pack[p.b.k] && (p.b.pack0 || 1) === 1) S.pack[p.b.k] = Math.round(x.emp_b);
-        } else { S.decisions.no[pk] = 1; delete S.decisions.ok[pk]; no++; }
+        } else { S.decisions.no[pk] = 'ai'; delete S.decisions.ok[pk]; no++; }
       }
     });
     prog.close();
@@ -2017,49 +2017,105 @@ async function aiFind() {
   if (!SAMPLE) { toast('Agrega tu clave de la API de Claude en Ajustes.'); settingsDialog(); return; }
   ensureMatches();
   const singles = M.groups.filter(g => g.status === 'one');
-  const tasks = [];
-  for (const g of singles) {
-    const it = g.anchor; const sid = g.members[0].sid;
-    const acc = new Map();
-    for (const t of it.tokSet) { const a = M.index.get(t); if (!a) continue; const w = IDF(t); for (const gi of a) if (gi !== g.id) acc.set(gi, (acc.get(gi) || 0) + w); }
-    const cands = [...acc.entries()].filter(([gi]) => !M.groups[gi].sids.has(sid)).sort((a, b) => b[1] - a[1]).slice(0, 30)
-      .map(([gi]) => M.groups[gi]).map(og => {
-        let best = null, bs = 0;
-        for (const m of og.members) { if (S.decisions.no[pairKey(it.k, m.it.k)]) continue; const sc = pairScore(it, m.it); if (sc > bs) { bs = sc; best = m.it; } }
-        return best ? {it: best, sc: bs} : null;
-      }).filter(x => x && x.sc >= 0.18).sort((a, b) => b.sc - a.sc).slice(0, 6);
-    if (cands.length) tasks.push({it, cands});
-  }
-  if (!tasks.length) { toast('No hay candidatos razonables para los productos sin pareja.'); return; }
-  const go = await confirmBox('Buscar parejas con Claude', `Claude revisará <b>${tasks.length}</b> productos sin pareja frente a sus candidatos más parecidos en los otros catálogos. Puede tardar unos minutos.`, 'Empezar');
-  if (!go) return;
-  const prog = progressBox('Claude está buscando parejas');
-  let found = 0;
+  if (!singles.length) { toast('No hay productos sin pareja.'); return; }
+  const mode = await new Promise(res => {
+    const m = openModal(`<h2>Buscar parejas con Claude</h2>
+      <p class="muted">Hay <b>${nf0.format(singles.length)}</b> productos sin pareja en los catálogos marcados.</p>
+      <div class="grid" style="gap:10px">
+        <button class="btn" data-m="quick" style="justify-content:flex-start;padding:12px;white-space:normal;text-align:left"><span><b>Búsqueda rápida</b><br><span class="small muted">Claude revisa cada producto contra los candidatos de nombre más parecido.</span></span></button>
+        <button class="btn ai" data-m="deep" style="justify-content:flex-start;padding:12px;white-space:normal;text-align:left"><span><b>Búsqueda profunda (recomendada si la rápida no encuentra)</b><br><span class="small muted">Claude primero identifica qué es cada producto y con qué otros nombres se conoce (ej. alicate = pinza = tenaza), busca candidatos con esos nombres y la medida en los otros catálogos, y vuelve a revisar también lo que había descartado antes. Respeta los productos que tú separaste a mano. Tarda más y cuesta un poco más (con Haiku, alrededor de ${nf2.format(Math.max(0.01, singles.length * 0.00012))} USD).</span></span></button>
+      </div>
+      <div class="ft"><button class="btn" data-m="x">Cancelar</button></div>`);
+    m.el.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { m.close(); res(b.dataset.m); });
+  });
+  if (mode === 'x') return;
+  const deep = mode === 'deep';
+  const blocked = pk => { const v = S.decisions.no[pk]; return deep ? v === 'u' : !!v; };
+  const sidOf = g => g.members[0].sid;
+  const prog = progressBox(deep ? 'Búsqueda profunda de parejas' : 'Claude está buscando parejas');
+  let found = 0, reviewed = 0;
   try {
-    const batches = []; for (let i = 0; i < tasks.length; i += 15) batches.push(tasks.slice(i, i + 15));
+    // 1) Expansión (solo profunda): tipo de producto, sinónimos y medida, según Claude.
+    const extra = new Map();
+    if (deep) {
+      const batches = []; for (let i = 0; i < singles.length; i += 40) batches.push(singles.slice(i, i + 40));
+      let d = 0;
+      await pool(batches, AI_PARALLEL, async batch => {
+        if (prog.cancelled) throw {code: 'cancelled'};
+        const prompt = `Eres experto en ferretería en Venezuela y Latinoamérica. Para cada producto indica el tipo de producto genérico, TODOS los otros nombres con que se le conoce en ferreterías (sinónimos, nombres regionales, nombres comerciales comunes) y su medida o tamaño principal.
+Responde SOLO JSON: {"r":[{"id":1,"tipo":"pinza","alt":["alicate","tenaza"],"medida":"8 pulg"}]}
+${batch.map((g, j) => `${j + 1}. ${fmtItemAI(g.anchor)}`).join('\n')}`;
+        try {
+          const r = await askJSON(prompt, {effort: 'low'});
+          for (const x of r.r || []) { const g = batch[x.id - 1]; if (g) extra.set(g.id, tokenize([x.tipo, ...(x.alt || []), x.medida].filter(Boolean).join(' '))); }
+        } catch (e) { if (FATAL(e)) throw e; }
+        finally { d++; if (!prog.cancelled) prog.set(0.35 * d / batches.length, `Identificando productos… ${Math.min(d * 40, singles.length)} de ${singles.length}`); }
+      });
+    }
+    // 2) Candidatos
+    prog.set(deep ? 0.36 : 0.02, 'Buscando candidatos…');
+    const allItems = M.all;
+    const tokIndex = new Map();
+    if (deep) for (const it of allItems) for (const t of it.tokSet) { let a = tokIndex.get(t); if (!a) tokIndex.set(t, a = []); a.push(it); }
+    const tasks = [];
+    for (const g of singles) {
+      const it = g.anchor, sid = sidOf(g);
+      let cands = [];
+      if (!deep) {
+        const acc = new Map();
+        for (const t of it.tokSet) { const a = M.index.get(t); if (!a) continue; const w = IDF(t); for (const gi of a) if (gi !== g.id) acc.set(gi, (acc.get(gi) || 0) + w); }
+        cands = [...acc.entries()].filter(([gi]) => !M.groups[gi].sids.has(sid)).sort((a, b) => b[1] - a[1]).slice(0, 30)
+          .map(([gi]) => M.groups[gi]).map(og => {
+            let best = null, bs = 0;
+            for (const m of og.members) { if (blocked(pairKey(it.k, m.it.k))) continue; const sc = pairScore(it, m.it); if (sc > bs) { bs = sc; best = m.it; } }
+            return best ? {it: best, sc: bs} : null;
+          }).filter(x => x && x.sc >= 0.18).sort((a, b) => b.sc - a.sc).slice(0, 6);
+      } else {
+        const q = new Set([...it.tokSet, ...(extra.get(g.id) || [])]);
+        const nums = new Set([...q].filter(t => /^\d/.test(t)));
+        const acc = new Map();
+        for (const t of q) {
+          const a = tokIndex.get(t); if (!a || a.length > 3000) continue;
+          const w = IDF(t);
+          for (const c of a) { if (c.sid === sid) continue; acc.set(c, (acc.get(c) || 0) + w); }
+        }
+        cands = [...acc.entries()].map(([c, w]) => {
+          if (blocked(pairKey(it.k, c.k))) return null;
+          let sc = w;
+          if (nums.size && c.nums.size) { let inter = 0; for (const n of c.nums) if (nums.has(n)) inter++; sc *= inter ? 1.5 : 0.4; }
+          return {it: c, sc};
+        }).filter(Boolean).sort((a, b) => b.sc - a.sc).slice(0, 8);
+      }
+      if (cands.length) tasks.push({it, cands});
+    }
+    if (!tasks.length) { prog.close(); toast(deep ? 'Ni con la búsqueda profunda aparecieron candidatos: estos productos probablemente no existen en los otros catálogos.' : 'No hay candidatos parecidos por nombre. Prueba la búsqueda profunda.', 6000); return; }
+    // 3) Claude decide
+    const batches = []; for (let i = 0; i < tasks.length; i += 12) batches.push(tasks.slice(i, i + 12));
     let doneB = 0;
+    const base = deep ? 0.4 : 0.05;
     await pool(batches, AI_PARALLEL, async batch => {
-      if (prog.cancelled) return;
-      const prompt = `Eres experto en productos de ferretería. Para cada producto, indica cuál de sus candidatos (de otro proveedor) es el mismo producto, o null si ninguno lo es.
+      if (prog.cancelled) throw {code: 'cancelled'};
+      const prompt = `Eres experto en productos de ferretería. Para cada producto, indica cuál de sus candidatos (de otro proveedor) es el mismo producto, o null si ninguno lo es. Los nombres pueden ser distintos (ej. "alicate" = "pinza", "desarmador" = "destornillador", "marro" = "mandarria"): fíjate en qué es el producto, no en las palabras exactas.
 ${EQUIV_RULE()}
 ${STRICT_RULES}
 Si solo cambia la presentación (unidad vs caja de N), sí es el mismo.
 Responde SOLO JSON: {"r":[{"id":1,"elegido":2}]}  (elegido = número del candidato o null)
-${batch.map((t, j) => `${j + 1}. Producto: ${fmtItemAI(t.it)}\n${t.cands.map((c, k) => `   ${k + 1}) ${fmtItemAI(c.it)}`).join('\n')}`).join('\n')}`;
-      let r; try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
-      finally { doneB++; if (!prog.cancelled) prog.set(doneB / batches.length, `Revisados ${Math.min(doneB * 15, tasks.length)} de ${tasks.length}…`); }
-      if (prog.cancelled) return;
+${batch.map((t, j) => `${j + 1}. Producto: ${fmtItemAI(t.it)}\n${t.cands.map((c, k) => { const r = priceRatio(t.it, c.it); return `   ${k + 1}) ${fmtItemAI(c.it)}${r && r > 1.5 ? ` (precio por unidad ×${nf2.format(r)})` : ''}`; }).join('\n')}`).join('\n')}`;
+      let r;
+      try { r = await askJSON(prompt, {effort: 'medium'}); } catch (e) { if (FATAL(e)) throw e; return; }
+      finally { doneB++; if (!prog.cancelled) prog.set(base + (1 - base) * doneB / batches.length, `Revisando candidatos… ${Math.min(doneB * 12, tasks.length)} de ${tasks.length}`); }
       for (const x of r.r || []) {
         const t = batch[x.id - 1]; if (!t) continue;
+        reviewed++;
         const c = x.elegido ? t.cands[x.elegido - 1] : null;
-        if (c) { S.decisions.ok[pairKey(t.it.k, c.it.k)] = 1; found++; }
-        else for (const cc of t.cands) S.decisions.no[pairKey(t.it.k, cc.it.k)] = 1;
+        if (c) { const pk = pairKey(t.it.k, c.it.k); S.decisions.ok[pk] = 1; delete S.decisions.no[pk]; found++; }
+        else for (const cc of t.cands) { const pk = pairKey(t.it.k, cc.it.k); if (S.decisions.no[pk] !== 'u') S.decisions.no[pk] = 'ai'; }
       }
     });
     prog.close();
-  } catch (e) { prog.close(); toast(aiErr(e), 5000); }
+  } catch (e) { prog.close(); if (e?.code !== 'cancelled') toast(aiErr(e), 5000); }
   matchDirty = true; saveConfig(); render();
-  toast(`Claude encontró ${found} pareja(s) nuevas.`, 4500);
+  toast(`Claude revisó ${nf0.format(reviewed)} productos y encontró ${nf0.format(found)} pareja(s) nuevas.${!deep && found === 0 ? ' Prueba la búsqueda profunda.' : ''}`, 6000);
 }
 
 /* ================= exportar ================= */
