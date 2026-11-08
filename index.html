@@ -248,7 +248,7 @@ function normText(s) {
   s = baseNorm(s);
   for (const re of PACK_RES) s = s.replace(re, ' ');
   s = s.replace(/(\d),(\d)/g, '$1.$2')
-    .replace(/["”″“]|''|\bpulgadas?\b|\bpulg\b\.?|\bplg\b\.?|\bpul\b\.?/g, ' in ')
+    .replace(/["”″“]|''|\bpulgadas?\b|\bpulg\b\.?|\bplg\b\.?|\bpul\b\.?|(\d)\s*pgds?\b\.?|\bpgds?\b\.?/g, (m, d) => (d || '') + ' in ')
     .replace(/\bmts?\b\.?|\bmetros?\b/g, ' m ')
     .replace(/\bmilimetros?\b/g, ' mm ').replace(/\bcentimetros?\b|\bcms\b/g, ' cm ')
     .replace(/\bkilos?\b|\bkgs\b|\bkilogramos?\b/g, ' kg ').replace(/\bgramos?\b|\bgrs?\b/g, ' g ')
@@ -262,18 +262,19 @@ function normText(s) {
 const SYN_RAW = {
   pinza: 'alicate alicates pinzas tenaza tenazas', mandarria: 'marro marros porra porras combo mandarrias',
   destornillador: 'desarmador desarmadores atornillador destornilladores', esmeril: 'pulidora pulidoras amoladora amoladoras esmeriladora',
-  sierra: 'segueta seguetas', metrica: 'flexometro flexometros wincha huincha metro', ajustable: 'inglesa',
+  sierra: 'segueta seguetas seguete seguetes', metrica: 'flexometro flexometros wincha huincha metro', ajustable: 'inglesa',
   tubo: 'tuberia tuberias', bombillo: 'bombilla bombillas foco focos ampolleta', breaker: 'braker interruptor termomagnetico',
   pegamento: 'pega pegas cola adhesivo', paso: 'arresto', regadera: 'ducha duchas', inodoro: 'poceta pocetas wc sanitario',
-  lavamanos: 'lavabo lavabos lavamano', fregadero: 'lavaplatos lavaplato', phillips: 'estrella cruz', plano: 'paleta pala',
+  lavamanos: 'lavabo lavabos lavamano', fregadero: 'lavaplatos lavaplato', phillips: 'estrella cruz estria estrias', plano: 'paleta pala',
   taladro: 'taladros', cerradura: 'chapa chapas', bisagra: 'bisagras', tornillo: 'tornillos', manguera: 'mangueras',
   brocha: 'brochas', martillo: 'martillos', serrucho: 'serruchos', candado: 'candados', carretilla: 'carretillas',
   teflon: 'teipe-teflon', extension: 'extensor extensiones', tomacorriente: 'toma tomas enchufe enchufes', llana: 'llanas',
-  cuchara: 'palustre palustres', nivel: 'niveles', espatula: 'espatulas', rodillo: 'rodillos', lija: 'lijas', soldadura: 'electrodo electrodos'
+  cuchara: 'palustre palustres', nivel: 'niveles', espatula: 'espatulas', rodillo: 'rodillos', lija: 'lijas', soldadura: 'electrodo electrodos',
+  broca: 'mecha mechas brocas', juego: 'jgo jgos juegos', arco: 'marco marcos arcos', destornillador2: 'destor destorn desarm destorm'
 };
 const SYN = new Map();
 function stemWord(t) { if (t.length > 3 && t.endsWith('s')) t = t.slice(0, -1); if (t.length >= 5 && /[aoe]$/.test(t)) t = t.slice(0, -1); return t; }
-for (const [canon, alts] of Object.entries(SYN_RAW)) { const c = stemWord(canon); for (const a of alts.split(' ')) SYN.set(stemWord(a), c); SYN.set(c, c); }
+for (const [canon0, alts] of Object.entries(SYN_RAW)) { const canon = canon0.replace(/\d+$/, ''); const c = stemWord(canon); for (const a of alts.split(' ')) SYN.set(stemWord(a), c); SYN.set(c, c); }
 function tokenize(s) {
   const out = [];
   for (let t of normText(s).split(/[^a-z0-9.\/]+/)) {
@@ -287,17 +288,61 @@ function tokenize(s) {
   return out;
 }
 // Versiones especiales: si solo una descripción la tiene, son productos distintos (ej. mandarria antichispas vs mandarria normal).
-const QUAL_VARIANT = new Set(tokenize(`antichispas inoxidable inox galvanizado industrial reforzado electrico inalambrico bateria neumatico hidraulico
+const QUAL_VARIANT = new Set(tokenize(`antichispas inoxidable inox galvanizado reforzado flap diamantado diamante electrico inalambrico bateria neumatico hidraulico
   trifasico monofasico bifasico explosion dielectrico aislado impermeable sanitario presion termofusion soldable cementar roscado juego kit set estuche`.replace(/\s+/g, ' ')));
 // Materiales: solo cuentan si AMBAS descripciones dicen el material y son distintos (una descripción más detallada no es una diferencia).
 const QUAL_MATERIAL = new Set(tokenize(`bronce cobre laton aluminio acero hierro pvc cpvc pead ppr polietileno plastico`.replace(/\s+/g, ' ')));
 // Detalles secundarios (mango, color, acabado, forma): pesan poco.
-const QUAL_WEAK = new Set(tokenize(`madera fibra vidrio goma silicona nylon cromado niquelado pavonado profesional pesado liviano blanco negro rojo azul
+const QUAL_WEAK = new Set(tokenize(`industrial madera fibra vidrio goma silicona nylon cromado niquelado pavonado profesional pesado liviano blanco negro rojo azul
   verde amarillo gris marron satinado mate brillante phillips estrella torx allen hexagonal plano redondo cuadrado hembra macho`.replace(/\s+/g, ' ')));
+// Medidas con unidad (8 in, 200 mm, 20 lb…). Se comparan por unidad; pulgadas y milímetros se convierten entre sí.
+const UNIT_TOK = new Set(['in','mm','cm','m','kg','g','lb','oz','l','ml','gal','v','w','a','cc','ft','yd','hp','psi','awg']);
+function numVal(t) { if (t.includes('/')) { const [a, b] = t.split('/').map(Number); return b ? a / b : NaN; } return parseFloat(t); }
+function extractDims(toks) {
+  const dims = [];
+  let pend = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (/^\d/.test(t)) {
+      const v = numVal(t);
+      if (!isFinite(v)) continue;
+      // número mixto: 1 1/2
+      if (t.includes('/') && pend.length && !pend[pend.length - 1].includes('/') && i > 0 && toks[i - 1] === pend[pend.length - 1]) { const prev = pend.pop(); pend.push(prev + '+' + t); }
+      else pend.push(t);
+    } else if (UNIT_TOK.has(t)) {
+      for (const p of pend) dims.push({u: t, v: p.split('+').reduce((a, x) => a + numVal(x), 0)});
+      pend = [];
+    } else pend = [];
+  }
+  return dims;
+}
+function dimsByUnit(dims) {
+  const m = {};
+  for (const d of dims) { let u = d.u, v = d.v; if (u === 'cm') { u = 'mm'; v *= 10; } if (u === 'm') { u = 'mm'; v *= 1000; } (m[u] = m[u] || []).push(v); }
+  return m;
+}
+const near = (a, b, tol) => Math.abs(a - b) <= tol * Math.max(a, b);
+// Compara medidas: devuelve 'match' (alguna medida igual), 'conflict' (mismas unidades, ninguna coincide) o null (no comparables)
+function compareDims(a, b) {
+  const A = a.dimU, B = b.dimU;
+  let shared = 0, conflict = 0, match = 0;
+  const check = (xs, ys, tol) => xs.some(x => ys.some(y => near(x, y, tol)));
+  for (const u in A) if (B[u]) { shared++; if (check(A[u], B[u], 0.02)) match++; else conflict++; }
+  // pulgadas vs milímetros
+  const cross = (P, Q) => P.in && !Q.in && Q.mm ? (check(P.in.map(x => x * 25.4), Q.mm, 0.04) ? 1 : -1) : 0;
+  const c1 = cross(A, B), c2 = cross(B, A);
+  if (c1 === 1 || c2 === 1) match++; else if (c1 === -1 || c2 === -1) { if (!shared) conflict++; }
+  if (match && !conflict) return 'match';
+  if (conflict && !match) return 'conflict';
+  if (match && conflict) return match >= conflict ? 'match' : 'conflict';
+  return null;
+}
 function prepItem(it) {
   it.tokSet = new Set(tokenize(it.desc));
+  it.dimU = dimsByUnit(extractDims(tokenize(it.desc)));
   // La marca escrita dentro de la descripción no debe pesar en el cruce (se compara aparte).
   if (it.brand) for (const t of tokenize(it.brand)) if (!/^\d/.test(t)) it.tokSet.delete(t);
+  it.head = [...it.tokSet].find(t => /^[a-z]{3,}$/.test(t) && !['jueg','set','kit'].includes(t)) || '';
   it.quals = [...it.tokSet].filter(t => QUAL_VARIANT.has(t) || (t.startsWith('anti') && t.length > 5));
   it.mats = [...it.tokSet].filter(t => QUAL_MATERIAL.has(t));
   it.qualsW = [...it.tokSet].filter(t => QUAL_WEAK.has(t));
@@ -317,15 +362,20 @@ function pairScore(a, b) {
   if (!wa || !wb) return 0;
   // Mezcla de similitud total y de contención: una descripción corta contenida en una larga y detallada sigue siendo parecida.
   let s = 0.5 * (2 * sw / (wa + wb)) + 0.5 * (sw / Math.min(wa, wb));
+  // Tipo de producto (primera palabra): si es distinto y ninguno menciona el tipo del otro, casi seguro son productos distintos.
+  if (a.head && b.head && a.head !== b.head && !b.tokSet.has(a.head) && !a.tokSet.has(b.head)) s *= 0.5;
+  // Medidas: primero con unidades (8 in = 200 mm); los números extra de una descripción más detallada no cuentan como diferencia.
+  const dc = compareDims(a, b);
   const na = a.nums, nb = b.nums;
-  if (na.size || nb.size) {
-    if (na.size && nb.size) {
-      let inter = 0; for (const n of na) if (nb.has(n)) inter++;
-      if (inter === na.size && inter === nb.size) s = Math.min(1, s * 1.08 + 0.04);
-      else if (inter === 0) s *= 0.3;
-      else s *= 0.55;
-    } else { const only = na.size ? na : nb; s *= (only.size === 1 && only.has('1')) ? 0.95 : 0.8; }
-  }
+  if (dc === 'match') s = Math.min(1, s * 1.1 + 0.06);
+  else if (dc === 'conflict') s *= 0.3;
+  else if (na.size && nb.size) {
+    let inter = 0; for (const n of na) if (nb.has(n)) inter++;
+    const small = Math.min(na.size, nb.size);
+    if (inter === small) s = Math.min(1, s * 1.05 + 0.03);
+    else if (inter === 0) s *= 0.35;
+    else s *= 0.75;
+  } else if (na.size || nb.size) { const only = na.size ? na : nb; s *= (only.size === 1 && only.has('1')) ? 0.95 : 0.85; }
   // Características distintivas (antichispas, inoxidable, material, color, tipo…): si una la tiene y la otra no, casi seguro no son el mismo producto.
   let qm = 0, qw = 0;
   for (const t of a.quals) if (!b.tokSet.has(t)) qm++;
@@ -342,7 +392,8 @@ function pairScore(a, b) {
   if (a.codeN && a.codeN.length >= 4 && a.codeN === b.codeN && s > 0.3) s = Math.max(s, 0.85);
   return s;
 }
-const AUTO_THR = 0.72, MIN_THR = 0.5;
+// Desde 0,42 se propone el cruce (como dudoso, para verificar con Claude o a mano); desde 0,72 se considera probable.
+const AUTO_THR = 0.72, MIN_THR = 0.42;
 // Precio comparable por unidad (lista, con IVA y descuentos comerciales, en USD a tu tasa). Sirve para detectar cruces sin sentido.
 function basePriceUSD(it) {
   const sup = S.suppliers.find(x => x.id === it.sid); if (!sup) return NaN;
@@ -357,12 +408,12 @@ function priceRatio(a, b) {
 function priceFactor(a, b) {
   const r = priceRatio(a, b);
   if (r == null) return 1;
-  if (r > 4) return 0.3;
-  if (r > 2.5) return 0.55;
-  if (r > 1.8) return 0.85;
+  if (r > 8) return 0.25;
+  if (r > 4) return 0.5;
+  if (r > 2.5) return 0.8;
   return 1;
 }
-const PRICE_ALERT = 2;
+const PRICE_ALERT = 3;
 function groupPriceRatio(g) {
   const v = g.members.map(m => basePriceUSD(m.it)).filter(x => x > 0 && isFinite(x));
   return v.length > 1 ? Math.max(...v) / Math.min(...v) : null;
@@ -758,6 +809,14 @@ function applyCfg(cfg) {
     methods: (s.methods || []).map(m => ({...newMethod(), ...m, rateSrc: m.rateSrc || (num(m.rate) > 0 ? 'manual' : 'mine'),
       terms: (m.terms && m.terms.length) ? m.terms.map(newTerm) : [newTerm({days: m.days, disc: m.disc, discMin: m.discMin})]}))}));
 }
+// Los descartes que hizo Claude con las reglas antiguas (demasiado estrictas) se borran una vez, para que se vuelvan a evaluar.
+function migrateDecisions() {
+  if (S.global.decV >= 2) return;
+  let n = 0;
+  for (const pk in S.decisions.no) if (S.decisions.no[pk] === 1) { delete S.decisions.no[pk]; n++; }
+  S.global.decV = 2;
+  if (n) { matchDirty = true; saveConfig(); setTimeout(() => toast(`Se reiniciaron ${nf0.format(n)} descartes antiguos hechos con reglas anteriores. Vuelve a verificar los cruces con Claude.`, 8000), 1500); }
+}
 async function loadAll() {
   const [cfgD, decD, qD] = await Promise.all([Store.get('config'), Store.get('decisions'), Store.get('qty')]);
   const cfg = P(cfgD, null);
@@ -766,6 +825,7 @@ async function loadAll() {
   const dec = P(decD, null);
   S.decisions = {ok: dec?.ok || {}, no: dec?.no || {}}; S.pack = dec?.pack || {};
   S.qty = P(qD, {}) || {};
+  migrateDecisions();
   const idx = cfg?.catIndex || {};
   const jobs = [];
   for (const sid in idx) {
@@ -944,6 +1004,7 @@ async function settingsDialog() {
     <p class="small muted" style="margin:0 0 8px">${isCloud ? `Guardados en la nube (Firebase) · sesión: <b>${esc(USER?.email || '')}</b>` : storeMode === 'local' ? 'Guardados solo en este navegador.' : ''}</p>
     <div class="row"><button class="btn sm" id="stExport">Descargar respaldo</button><label class="btn sm" style="cursor:pointer">Restaurar respaldo<input type="file" id="stImport" accept=".json" class="hide"></label>
       ${isCloud ? '<button class="btn sm" id="stReload">Recargar datos de la nube</button><button class="btn sm ghost" data-act="logout">Cerrar sesión</button>' : ''}
+      <button class="btn sm" id="stResetAI" title="Borra los cruces que Claude descartó o confirmó automáticamente. Lo que tú separaste o confirmaste a mano se conserva.">Reiniciar decisiones de Claude</button>
       <button class="btn sm ghost danger" data-act="resetfb">${isCloud ? 'Desconectar esta base de datos' : 'Cambiar dónde se guardan los datos'}</button></div>
     ${isCloud ? `<h3>Usuarios autorizados</h3><p class="small muted" style="margin:0 0 8px">Correos de Google que pueden entrar. Solo el administrador puede cambiar esta lista.</p>
       <div id="stMembers" class="small muted">Cargando…</div>
@@ -972,11 +1033,18 @@ async function settingsDialog() {
       if (!await confirmBox('Restaurar respaldo', `Se reemplazarán todos los datos actuales por el respaldo del ${esc(new Date(d.at).toLocaleString('es-VE'))}.`, 'Restaurar')) return;
       applyCfg({global: d.global, suppliers: d.suppliers});
       S.decisions = d.decisions || {ok: {}, no: {}}; S.pack = d.pack || {}; S.qty = d.qty || {};
+      migrateDecisions();
       S.catalogs = {};
       for (const sid in d.catalogs || {}) { S.catalogs[sid] = {files: d.catalogs[sid].files, date: d.catalogs[sid].date, items: d.catalogs[sid].items.map(a => unpackItem(a, sid))}; await saveCatalog(sid); }
       saveConfig(); matchDirty = true; UI.planDirty = true; applyRates();
       m.close(); render(); toast('Respaldo restaurado');
     } catch (err) { toast('No se pudo restaurar: ' + (err.message || err)); }
+  };
+  el.querySelector('#stResetAI').onclick = async () => {
+    const nNo = Object.values(S.decisions.no).filter(v => v !== 'u').length;
+    if (!await confirmBox('Reiniciar decisiones de Claude', `Se borrarán <b>${nf0.format(nNo)}</b> descartes automáticos para que los cruces se vuelvan a evaluar. Lo que separaste a mano se conserva.`, 'Reiniciar')) return;
+    for (const pk in S.decisions.no) if (S.decisions.no[pk] !== 'u') delete S.decisions.no[pk];
+    matchDirty = true; UI.planDirty = true; saveConfig(); m.close(); render(); toast('Listo: vuelve a la Comparativa y pulsa «Verificar cruces con Claude».');
   };
   el.querySelector('#stReload')?.addEventListener('click', async () => { m.close(); setPill('Cargando datos…'); await loadAll(); setPill('En la nube · ' + USER.email, 'ok'); render(); toast('Datos actualizados'); });
   if (isCloud) {
