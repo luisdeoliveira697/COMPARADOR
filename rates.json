@@ -4,10 +4,16 @@
   "bcvEur": 1009.34130871,
   "bcvFechaValor": "Viernes, 13 Noviembre 2026",
   "bcvSource": "bcv.org.ve",
-  "binance": 1043.8,
-  "binanceAt": "2026-11-13T17:53:16.253Z",
-  "updatedAt": "2026-11-13T17:53:16.253Z",
+  "binance": 1059.51,
+  "binanceAt": "2026-11-13T22:49:20.041Z",
+  "updatedAt": "2026-11-13T22:49:20.041Z",
   "by": "auto",
   "sources": "BCV: bcv.org.ve · Binance: Binance P2P (mediana de anuncios USDT/VES)",
-  "lastCheck": "2026-11-13T17:53:16.253Z"
+  "lastCheck": "2026-11-13T22:49:20.041Z",
+  "bcvNext": {
+    "usd": 914.0218,
+    "eur": 1010.56078251,
+    "valueDate": "2026-11-16",
+    "valueText": "Lunes, 16 Noviembre 2026"
+  }
 }
